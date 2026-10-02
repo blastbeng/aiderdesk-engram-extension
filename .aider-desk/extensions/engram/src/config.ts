@@ -160,7 +160,9 @@ export const DEFAULT_CONFIG: EngramConfig = {
     model: 'synthetic/syn:small:text',
     temperature: 0.1,
     max_tokens: 8192,
-    timeout_ms: 30000,
+    // 60 s: small reasoning models routinely spend 20-40 s before the first
+    // content token; a 30 s default produced chronic timeouts in production.
+    timeout_ms: 60000,
     headers: {},
   },
   extraction: {

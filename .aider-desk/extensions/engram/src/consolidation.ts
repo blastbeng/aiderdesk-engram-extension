@@ -100,7 +100,8 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
 
     state.totals.llmCalls += 1;
     if (!result.ok) {
-      state.totals.llmFailures += 1;
+      // An external abort (extension unload) is not an LLM failure.
+      if (result.kind !== 'aborted') state.totals.llmFailures += 1;
       report.failure = `batch ${i + 1}: ${result.kind} - ${result.message}`;
       logger.warn(`consolidation stopped: ${report.failure}`);
       break;

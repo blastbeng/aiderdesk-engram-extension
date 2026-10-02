@@ -38,7 +38,7 @@ import { logger } from './src/logger';
 import { loadState, saveState, projectStats, type EngramState } from './src/state';
 import { runExtraction } from './src/extraction';
 import { runConsolidation } from './src/consolidation';
-import { retrieveForPrompt, wrapBlock } from './src/retrieval';
+import { retrieveForPrompt, stripBlock, wrapBlock } from './src/retrieval';
 import {
   getMemoryContextSafely,
   importanceOf,
@@ -196,8 +196,11 @@ export default class EngramMemoryExtension implements Extension {
       const { block } = await retrieveForPrompt(context, context.getProjectDir(), prompt, cfg);
       if (!block) return;
 
+      // Strip-then-append: the reminder hook can fire more than once per
+      // request, and append-only injection would stack a second copy of the
+      // same block (observed live). Replacement keeps exactly one.
       return {
-        remindersContent: `${event.remindersContent}\n\n${wrapBlock(block)}`.trim(),
+        remindersContent: [stripBlock(event.remindersContent), wrapBlock(block)].filter(Boolean).join('\n\n'),
       };
     } catch (error) {
       logger.warn(`retrieval failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -215,17 +218,20 @@ export default class EngramMemoryExtension implements Extension {
     if (cfg.extraction.trigger !== 'agent_end') return;
 
     this.queueExtraction(context, event.contextMessages, agentId);
+    // Consolidation must also be driven by agent_end rounds: wiring it only
+    // into onTaskClosed left it unrunnable for the default trigger mode.
+    this.maybeConsolidate(context, agentId);
   }
 
   async onPromptFinished(event: PromptFinishedEvent, context: ExtensionContext): Promise<void> {
-    if (this.config.extraction.trigger !== 'prompt_end') return;
+    // Resolve the per-agent config BEFORE checking the trigger: the global
+    // trigger must not mask a per-agent prompt_end override (and vice versa).
+    const agentId = await this.agentIdFor(context);
+    const cfg = resolveConfig(this.config, agentId);
+    if (!cfg.enabled || !cfg.extraction.enabled || cfg.extraction.trigger !== 'prompt_end') return;
 
     const taskContext = context.getTaskContext();
     if (!taskContext) return;
-
-    const agentId = await this.agentIdFor(context);
-    const cfg = resolveConfig(this.config, agentId);
-    if (!cfg.enabled || !cfg.extraction.enabled) return;
 
     void (async () => {
       try {

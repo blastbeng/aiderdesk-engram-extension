@@ -30,6 +30,7 @@ import {
   buildRepairUser,
 } from './prompts';
 import { buildTranscript, estimateTokens, isExtensionInjected } from './transcript';
+import { normalizeStatement } from './memory-format';
 import { looksSecret, redactSecrets } from './privacy';
 import {
   getMemoryContextSafely,
@@ -152,7 +153,8 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
 
   state.totals.llmCalls += 1;
   if (!first.ok) {
-    state.totals.llmFailures += 1;
+    // An external abort (extension unload) is not an LLM failure.
+    if (first.kind !== 'aborted') state.totals.llmFailures += 1;
     report.failure = first.message;
     logger.warn(`extraction skipped: secondary LLM ${first.kind} - ${first.message}`);
     saveState(statePath, state);
@@ -171,7 +173,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
     }, options.taskContext);
     state.totals.llmCalls += 1;
     if (!repaired.ok) {
-      state.totals.llmFailures += 1;
+      if (repaired.kind !== 'aborted') state.totals.llmFailures += 1;
       report.failure = `repair call failed: ${repaired.message}`;
       saveState(statePath, state);
       return report;
@@ -185,8 +187,11 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
     }
   }
 
-  // --- 5. Filter: importance floor, secret sweep, hard candidate cap.
+  // --- 5. Filter: importance floor, secret sweep, hard candidate cap, and a
+  //        deterministic within-batch dedup (the model sometimes restates the
+  //        same fact twice in one round; only the first copy is classified).
   const candidates: MemoryCandidate[] = [];
+  const seenCandidates = new Set<string>();
   for (const candidate of parsed.data!.memories) {
     if (candidate.importance < config.extraction.min_importance) {
       report.skipped += 1;
@@ -197,6 +202,12 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       logger.warn('dropped a candidate that contained a secret');
       continue;
     }
+    const key = normalizeStatement(candidate.content);
+    if (key && seenCandidates.has(key)) {
+      report.skipped += 1;
+      continue;
+    }
+    if (key) seenCandidates.add(key);
     candidates.push(candidate);
   }
   report.candidates = candidates.length;
@@ -226,23 +237,28 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
 
   const classified = await classify(config, candidates, existingForCandidate, options.signal, state, statePath, options.taskContext);
   if (!classified) {
-    // Classification unavailable: fall back to plain NEW writes, which is safe
-    // (worst case is a duplicate) and never loses information.
-    logger.warn('dedup classification unavailable - writing candidates as NEW');
-    for (const candidate of candidates) {
-      const id = await storeNew(
-        memory,
-        projectDir,
-        taskId,
-        candidate.content,
-        metaForNew({
-          category: candidate.category,
-          importance: candidate.importance,
-          scope: candidate.scope,
-          confidence: candidate.confidence,
-        }),
-      );
-      if (id) report.stored += 1;
+    // Classification unavailable. The old fallback (write everything as NEW)
+    // polluted the store with duplicates every time the classifier was down -
+    // observed live: 36 stored, 0 updated, in one deployment. The fallback is
+    // now conservative:
+    //   - verbatim restatements of a known memory count as DUPLICATE;
+    //   - only candidates at least one importance step above the floor are
+    //     written as NEW (worst case a duplicate, never a data loss);
+    //   - the rest are dropped - a later successful round re-extracts them.
+    logger.warn('dedup classification unavailable - using deterministic fallback');
+    const gate = Math.min(5, config.extraction.min_importance + 1);
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      if (exactDuplicateOf(corpora[i] ?? [], candidate.content)) {
+        report.duplicates += 1;
+        state.totals.duplicatesSkipped += 1;
+        continue;
+      }
+      if (candidate.importance < gate) {
+        report.skipped += 1;
+        continue;
+      }
+      report.stored += await writeNew(memory, projectDir, taskId, candidate);
     }
     finish(report, state, statePath, projectDir);
     return report;
@@ -251,7 +267,18 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
   const byIndex = new Map<number, ClassificationResult>();
   for (const result of classified) byIndex.set(result.index, result);
 
-  // --- 7. Apply.
+  // --- 7. Apply. Every NEW write first passes a deterministic exact-match
+  //        guard against the candidate's own dedup corpus, so a NEW verdict
+  //        that contradicts a verbatim existing memory cannot create a row.
+  const writeNewChecked = async (candidate: MemoryCandidate, corpus: MemoryEntry[]): Promise<1 | 0> => {
+    if (exactDuplicateOf(corpus, candidate.content)) {
+      report.duplicates += 1;
+      state.totals.duplicatesSkipped += 1;
+      return 0;
+    }
+    return writeNew(memory, projectDir, taskId, candidate);
+  };
+
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i];
     const corpus = corpora[i];
@@ -259,7 +286,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
     const verdict = byIndex.get(i);
 
     if (!verdict) {
-      report.stored += await writeNew(memory, projectDir, taskId, candidate);
+      report.stored += await writeNewChecked(candidate, corpus);
       continue;
     }
 
@@ -273,7 +300,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       }
 
       case 'NEW': {
-        report.stored += await writeNew(memory, projectDir, taskId, candidate);
+        report.stored += await writeNewChecked(candidate, corpus);
         break;
       }
 
@@ -281,7 +308,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       case 'CONFLICT':
       case 'OBSOLETE': {
         if (!target) {
-          report.stored += await writeNew(memory, projectDir, taskId, candidate);
+          report.stored += await writeNewChecked(candidate, corpus);
           break;
         }
         const statement = (verdict.mergedContent ?? '').trim() || candidate.content;
@@ -297,7 +324,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
           state.totals.updated += 1;
           if (verdict.verdict === 'OBSOLETE') report.obsolete += 1;
         } else {
-          report.stored += await writeNew(memory, projectDir, taskId, candidate);
+          report.stored += await writeNewChecked(candidate, corpus);
         }
         break;
       }
@@ -326,7 +353,7 @@ async function classify(
 
   state.totals.llmCalls += 1;
   if (!result.ok) {
-    state.totals.llmFailures += 1;
+    if (result.kind !== 'aborted') state.totals.llmFailures += 1;
     return null;
   }
 
@@ -334,6 +361,21 @@ async function classify(
   if (!parsed.ok || !parsed.data) return null;
 
   return parsed.data.results;
+}
+
+/**
+ * Deterministic duplicate guard: the candidate statement, normalized, already
+ * exists verbatim in the corpus. Cheaper and more reliable than the LLM
+ * classifier for this narrow case; catches the exact restatements that
+ * otherwise became permanent duplicates.
+ */
+function exactDuplicateOf(corpus: MemoryEntry[], content: string): MemoryEntry | null {
+  const key = normalizeStatement(content);
+  if (!key) return null;
+  for (const entry of corpus) {
+    if (normalizeStatement(statementOf(entry)) === key) return entry;
+  }
+  return null;
 }
 
 async function writeNew(

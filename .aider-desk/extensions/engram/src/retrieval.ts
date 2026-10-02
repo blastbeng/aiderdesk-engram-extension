@@ -58,6 +58,19 @@ export async function retrieveForPrompt(
 }
 
 /**
+ * Removes an Engram block previously injected into remindersContent, so a
+ * repeated reminder hook (retries, re-optimization) can never stack a second
+ * copy of the same memories onto the user request. Idempotence by replacement:
+ * strip-then-append always yields exactly one block.
+ */
+export function stripBlock(text: string | undefined): string {
+  if (!text) return '';
+  return text
+    .replace(/<engram-memory-context>[\s\S]*?<\/engram-memory-context>\s*/g, '')
+    .trim();
+}
+
+/**
  * The exact text appended to the main model's context.
  */
 export function wrapBlock(block: string): string {

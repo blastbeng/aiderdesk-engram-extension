@@ -18,7 +18,14 @@
  *     returned MemoryEntry carries no distance, so callers cannot re-filter.
  */
 import type { ExtensionContext, MemoryContext, MemoryEntry } from '@aiderdesk/extensions';
-import { decodeMemory, encodeMemory, memoryForPrompt, toEntryType, type MemoryMeta } from './memory-format';
+import {
+  decodeMemory,
+  encodeMemory,
+  memoryForPrompt,
+  normalizeStatement,
+  toEntryType,
+  type MemoryMeta,
+} from './memory-format';
 
 export interface ScopedMemories {
   project: MemoryEntry[];
@@ -82,7 +89,22 @@ export async function retrieveScoped(
     return (b.timestamp ?? 0) - (a.timestamp ?? 0);
   });
 
-  return all.slice(0, Math.max(1, limit));
+  // Deterministic statement-level dedup after ranking: keep the highest-ranked
+  // copy of a fact and drop exact (normalized) duplicates. A verbatim
+  // restatement that slipped past classification must never occupy two slots
+  // of the limit or appear twice in a dedup corpus.
+  const seenStatements = new Set<string>();
+  const unique: MemoryEntry[] = [];
+  for (const entry of all) {
+    const key = normalizeStatement(statementOf(entry));
+    if (key) {
+      if (seenStatements.has(key)) continue;
+      seenStatements.add(key);
+    }
+    unique.push(entry);
+  }
+
+  return unique.slice(0, Math.max(1, limit));
 }
 
 export function isManaged(entry: MemoryEntry): boolean {

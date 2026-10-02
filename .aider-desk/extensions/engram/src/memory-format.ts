@@ -166,6 +166,18 @@ function parseFooter(raw: string): MemoryMeta | null {
 }
 
 /**
+ * Deterministic comparison key for a statement: lowercase, strip punctuation,
+ * collapse whitespace. Two statements with the same key are the same fact as
+ * far as deduplication is concerned - no embedding or LLM needed.
+ */
+export function normalizeStatement(statement: string): string {
+  return statement
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+/**
  * Strip the footer for display / embedding comparison.
  */
 export function stripFooter(content: string): string {

@@ -224,11 +224,44 @@ export async function probe(cfg: SecondaryLlmConfig): Promise<LlmResult> {
     user: 'Reply: OK',
     // Reasoning models (e.g. synthetic/*, DeepSeek-R1 style) spend tokens on
     // reasoning_content before any content appears; too small a cap yields
-    // content: null with finish_reason "length". 256 keeps the probe cheap
-    // while leaving room for the reasoning + a one-word answer.
-    maxTokens: 256,
+    // content: null with finish_reason "length". 1024 keeps the probe cheap
+    // while leaving real room for the reasoning + a one-word answer (256 was
+    // exhausted by reasoning alone against syn:small in live testing).
+    maxTokens: 1024,
     temperature: 0,
   });
+}
+
+/**
+ * Bounded retry for TRANSIENT failures only. An endpoint that is restarting or
+ * a connection blip should not kill a whole background extraction; nothing
+ * else is worth a second call:
+ *   - 'aborted' / 'disabled' are never retried (cancellation / config error);
+ *   - 'malformed' / 'empty' are not retried (model behavior, not transport);
+ *   - 'http_error' is retried only for 429 and 5xx (4xx client errors are
+ *     deterministic).
+ * External cancellation between attempts stops the loop immediately.
+ */
+const MAX_LLM_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 1000;
+
+function isTransientFailure(result: LlmFailure): boolean {
+  if (result.kind === 'unreachable' || result.kind === 'timeout') return true;
+  if (result.kind === 'http_error') {
+    return result.status === 429 || (result.status !== undefined && result.status >= 500);
+  }
+  return false;
+}
+
+async function withRetries(req: ChatRequest, attempt: () => Promise<LlmResult>): Promise<LlmResult> {
+  let result = await attempt();
+  for (let n = 1; n < MAX_LLM_ATTEMPTS && !result.ok && isTransientFailure(result); n++) {
+    if (req.signal?.aborted) break;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * n));
+    if (req.signal?.aborted) break;
+    result = await attempt();
+  }
+  return result;
 }
 
 /**
@@ -240,18 +273,21 @@ export async function probe(cfg: SecondaryLlmConfig): Promise<LlmResult> {
  *                classification) within extensions". Requires a task context;
  *                falls back to HTTP when none is available so a background
  *                extraction never dies because a task was closed.
+ *
+ * Both transports retry transient failures (see withRetries).
  */
 export async function chatWithTransport(
   cfg: SecondaryLlmConfig,
   req: ChatRequest,
   taskContext?: TaskContext | null,
 ): Promise<LlmResult> {
-  if (cfg.transport !== 'aiderdesk') return chat(cfg, req);
+  // HTTP transport, or the degraded aiderdesk-without-task-context fallback
+  // (a background extraction whose task was closed in the meantime).
+  if (cfg.transport !== 'aiderdesk' || !taskContext || typeof taskContext.generateText !== 'function') {
+    return withRetries(req, () => chat(cfg, req));
+  }
 
   const started = Date.now();
-  if (!taskContext || typeof taskContext.generateText !== 'function') {
-    return chat(cfg, req);
-  }
   if (!cfg.model_id) {
     return {
       ok: false,
@@ -265,22 +301,24 @@ export async function chatWithTransport(
     return { ok: false, kind: 'aborted', message: 'request cancelled', durationMs: 0 };
   }
 
-  try {
-    const text = await taskContext.generateText(cfg.model_id, req.system, req.user);
-    if (text === undefined || text === null) {
-      return {
-        ok: false,
-        kind: 'empty',
-        message: `generateText("${cfg.model_id}") returned no text - check that the model id exists in Settings > Models`,
-        durationMs: Date.now() - started,
-      };
+  return withRetries(req, async (): Promise<LlmResult> => {
+    try {
+      const text = await taskContext.generateText(cfg.model_id, req.system, req.user);
+      if (text === undefined || text === null) {
+        return {
+          ok: false,
+          kind: 'empty',
+          message: `generateText("${cfg.model_id}") returned no text - check that the model id exists in Settings > Models`,
+          durationMs: Date.now() - started,
+        };
+      }
+      if (!text.trim()) {
+        return { ok: false, kind: 'empty', message: 'empty completion', durationMs: Date.now() - started };
+      }
+      return { ok: true, text, durationMs: Date.now() - started };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, kind: 'unreachable', message: `generateText failed: ${msg}`, durationMs: Date.now() - started };
     }
-    if (!text.trim()) {
-      return { ok: false, kind: 'empty', message: 'empty completion', durationMs: Date.now() - started };
-    }
-    return { ok: true, text, durationMs: Date.now() - started };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, kind: 'unreachable', message: `generateText failed: ${msg}`, durationMs: Date.now() - started };
-  }
+  });
 }
