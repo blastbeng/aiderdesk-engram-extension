@@ -54,7 +54,7 @@ cp -r .aider-desk/extensions/engram ~/.aider-desk/extensions/engram
 # 2. Restart AiderDesk — TS extensions load via jiti, no build, no npm install
 
 # 3. Settings → Extensions → Engram → point base_url at your LLM endpoint
-#    (default: http://192.168.1.29:4000/v1, api_key "local", model "small-model")
+#    (default: http://192.168.1.13:4000/v1, api_key "local", model "synthetic/syn:small:text")
 ```
 
 That's it — memory extraction starts at the end of the next agent turn. Full walkthrough: [Installation](#6-installation-10-steps).
@@ -84,7 +84,7 @@ That's it — memory extraction starts at the end of the next agent turn. Full w
                         │ HTTP OpenAI-compatible (transport "http")
                         ▼
         llama-server on the secondary GPU (e.g. RTX 3060 12 GB)
-        http://192.168.1.29:4000/v1
+        http://192.168.1.13:4000/v1
 ```
 
 **Extraction flow** (end of agent turn):
@@ -193,9 +193,9 @@ Notes:
   "secondary_llm": {
     "transport": "http",                        // "http" (recommended) or "aiderdesk"
     "model_id": "openai-compatible/engram-secondary", // aiderdesk transport only
-    "base_url": "http://192.168.1.29:4000/v1",
+    "base_url": "http://192.168.1.13:4000/v1",
     "api_key": "local",                          // llama-server accepts any string
-    "model": "small-model",                      // model name served by the endpoint
+    "model": "synthetic/syn:small:text",         // model name served by the endpoint
     "temperature": 0.1,
     "max_tokens": 8192,
     "timeout_ms": 30000
@@ -229,7 +229,7 @@ Any OpenAI-compatible URL works: Ollama (`http://host:11434/v1`), LiteLLM, vLLM,
 
 ## 5. Installation (10 steps)
 
-1. **Start llama-server** on the secondary-GPU machine (see Requirements) and verify: `curl http://192.168.1.29:4000/v1/models`.
+1. **Start llama-server** on the secondary-GPU machine (see Requirements) and verify: `curl http://192.168.1.13:4000/v1/models`.
 2. **Copy the extension folder** into AiderDesk's extensions directory:
    ```bash
    cp -r .aider-desk/extensions/engram ~/.aider-desk/extensions/engram

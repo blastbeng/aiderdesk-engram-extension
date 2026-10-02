@@ -140,7 +140,11 @@ export async function chat(cfg: SecondaryLlmConfig, req: ChatRequest): Promise<L
 
     const text = extractCompletion(payload);
     if (text === null) {
-      return { ok: false, kind: 'malformed', message: 'response has no chat completion content', durationMs: Date.now() - started };
+      // Reasoning models often burn the whole budget in reasoning_content and
+      // return content: null with finish_reason "length" - surface that.
+      const finish = (payload as { choices?: { finish_reason?: unknown }[] }).choices?.[0]?.finish_reason;
+      const hint = typeof finish === 'string' && finish ? ` (finish_reason=${finish} - reasoning models may need a larger max_tokens)` : '';
+      return { ok: false, kind: 'malformed', message: `response has no chat completion content${hint}`, durationMs: Date.now() - started };
     }
     if (!text.trim()) {
       return { ok: false, kind: 'empty', message: 'empty completion', durationMs: Date.now() - started };
@@ -218,7 +222,11 @@ export async function probe(cfg: SecondaryLlmConfig): Promise<LlmResult> {
   return chat(cfg, {
     system: 'You are a health probe. Reply with exactly: OK',
     user: 'Reply: OK',
-    maxTokens: 8,
+    // Reasoning models (e.g. synthetic/*, DeepSeek-R1 style) spend tokens on
+    // reasoning_content before any content appears; too small a cap yields
+    // content: null with finish_reason "length". 256 keeps the probe cheap
+    // while leaving room for the reasoning + a one-word answer.
+    maxTokens: 256,
     temperature: 0,
   });
 }

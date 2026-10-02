@@ -56,7 +56,7 @@ export interface SecondaryLlmConfig {
    * transport === 'aiderdesk'. Example: "openai-compatible/engram-secondary".
    */
   model_id: string;
-  /** OpenAI-compatible base URL, e.g. http://192.168.1.29:4000/v1 */
+  /** OpenAI-compatible base URL, e.g. http://192.168.1.13:4000/v1 */
   base_url: string;
   /** API key. llama-server / Ollama usually accept any non-empty string, e.g. "local". */
   api_key: string;
@@ -125,9 +125,9 @@ export const DEFAULT_CONFIG: EngramConfig = {
   secondary_llm: {
     transport: 'http',
     model_id: 'openai-compatible/engram-secondary',
-    base_url: 'http://192.168.1.29:4000/v1',
+    base_url: 'http://192.168.1.13:4000/v1',
     api_key: 'local',
-    model: 'small-model',
+    model: 'synthetic/syn:small:text',
     temperature: 0.1,
     max_tokens: 8192,
     timeout_ms: 30000,
