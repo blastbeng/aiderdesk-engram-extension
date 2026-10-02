@@ -33,7 +33,7 @@ import type {
   ContextMessage,
 } from '@aiderdesk/extensions';
 
-import { loadConfig, saveConfig, mergeConfig, type EngramConfig } from './src/config';
+import { loadConfig, saveConfig, mergeConfig, resolveConfig, hasAgentOverride, type EngramConfig } from './src/config';
 import { logger } from './src/logger';
 import { loadState, saveState, projectStats, type EngramState } from './src/state';
 import { runExtraction } from './src/extraction';
@@ -77,8 +77,18 @@ export default class EngramMemoryExtension implements Extension {
     capabilities: ['commands', 'settings', 'events'],
   };
 
-  private config: EngramConfig = loadConfig(CONFIG_PATH);
-  private state: EngramState = loadState(STATE_PATH);
+  /**
+   * Test seam (tests/run.ts scenario 8): redirect the config/state files so a
+   * harness can drive this class end to end without touching the real
+   * config.json/state.json. AiderDesk never sets it - production always uses
+   * the extension directory.
+   */
+  static testPaths: { configPath?: string; statePath?: string } | null = null;
+
+  private readonly configPath = EngramMemoryExtension.testPaths?.configPath ?? CONFIG_PATH;
+  private readonly statePath = EngramMemoryExtension.testPaths?.statePath ?? STATE_PATH;
+  private config: EngramConfig = loadConfig(this.configPath);
+  private state: EngramState = loadState(this.statePath);
   private readonly abortController = new AbortController();
   /** Serialized work queue per project, so memory writes never interleave. */
   private readonly queues = new Map<string, Promise<void>>();
@@ -88,12 +98,34 @@ export default class EngramMemoryExtension implements Extension {
 
   // ---------------------------------------------------------------- lifecycle
 
+  /**
+   * Resolve the AiderDesk agent profile id for the current task.
+   *
+   * `TaskContext.getTaskAgentProfile()` is the documented resolver: task-level
+   * agentProfileId first, project default second, task provider/model overrides
+   * applied. Falls back to the raw task data, then to null, which means
+   * "no per-agent override - use the global config".
+   */
+  private async agentIdFor(context: ExtensionContext): Promise<string | null> {
+    const taskContext = context.getTaskContext();
+    if (!taskContext) return null;
+    try {
+      const profile = await taskContext.getTaskAgentProfile();
+      if (profile?.id) return profile.id;
+    } catch {
+      /* resolver unavailable - fall back to the raw task field */
+    }
+    return taskContext.data?.agentProfileId ?? null;
+  }
+
   async onLoad(context: ExtensionContext): Promise<void> {
     logger.bind(context);
     logger.setConfig(this.config.logging);
 
+    const overrides = Object.keys(this.config.agents);
     logger.info(
-      `loaded (secondary LLM: ${this.config.secondary_llm.model} @ ${this.config.secondary_llm.base_url})`,
+      `loaded (secondary LLM: ${this.config.secondary_llm.model} @ ${this.config.secondary_llm.base_url}, ` +
+        `per-agent overrides: ${overrides.length ? overrides.join(', ') : 'none'})`,
     );
 
     if (!this.config.enabled) {
@@ -127,7 +159,7 @@ export default class EngramMemoryExtension implements Extension {
     this.abortController.abort('extension unloaded');
     // Let queued work settle so we do not leave half-written memories.
     await Promise.allSettled(Array.from(this.queues.values())).catch(() => undefined);
-    saveState(STATE_PATH, this.state);
+    saveState(this.statePath, this.state);
   }
 
   // ---------------------------------------------------------------- retrieval
@@ -137,7 +169,8 @@ export default class EngramMemoryExtension implements Extension {
    * which is the point where content actually reaches the main model.
    */
   async onPromptStarted(event: PromptStartedEvent, context: ExtensionContext): Promise<void> {
-    if (!this.config.enabled || !this.config.retrieval.enabled) return;
+    const cfg = resolveConfig(this.config, await this.agentIdFor(context));
+    if (!cfg.enabled || !cfg.retrieval.enabled) return;
     const taskId = context.getTaskContext()?.data?.id;
     if (taskId) this.lastPrompt.set(taskId, event.prompt ?? '');
   }
@@ -150,15 +183,17 @@ export default class EngramMemoryExtension implements Extension {
     event: ImportantRemindersEvent,
     context: ExtensionContext,
   ): Promise<void | Partial<ImportantRemindersEvent>> {
-    if (!this.config.enabled || !this.config.retrieval.enabled) return;
-
     const taskContext = context.getTaskContext();
     const taskId = taskContext?.data?.id;
     const prompt = (taskId && this.lastPrompt.get(taskId)) || '';
     if (!prompt) return;
 
+    const agentId = event.agentProfile?.id ?? (await this.agentIdFor(context));
+    const cfg = resolveConfig(this.config, agentId);
+    if (!cfg.enabled || !cfg.retrieval.enabled) return;
+
     try {
-      const { block } = await retrieveForPrompt(context, context.getProjectDir(), prompt, this.config);
+      const { block } = await retrieveForPrompt(context, context.getProjectDir(), prompt, cfg);
       if (!block) return;
 
       return {
@@ -173,24 +208,29 @@ export default class EngramMemoryExtension implements Extension {
   // -------------------------------------------------------------- extraction
 
   async onAgentFinished(event: AgentFinishedEvent, context: ExtensionContext): Promise<void> {
-    if (!this.config.enabled || !this.config.extraction.enabled) return;
-    if (this.config.extraction.trigger !== 'agent_end') return;
     if (event.aborted) return;
+    const agentId = await this.agentIdFor(context);
+    const cfg = resolveConfig(this.config, agentId);
+    if (!cfg.enabled || !cfg.extraction.enabled) return;
+    if (cfg.extraction.trigger !== 'agent_end') return;
 
-    this.queueExtraction(context, event.contextMessages);
+    this.queueExtraction(context, event.contextMessages, agentId);
   }
 
   async onPromptFinished(event: PromptFinishedEvent, context: ExtensionContext): Promise<void> {
-    if (!this.config.enabled || !this.config.extraction.enabled) return;
     if (this.config.extraction.trigger !== 'prompt_end') return;
 
     const taskContext = context.getTaskContext();
     if (!taskContext) return;
 
+    const agentId = await this.agentIdFor(context);
+    const cfg = resolveConfig(this.config, agentId);
+    if (!cfg.enabled || !cfg.extraction.enabled) return;
+
     void (async () => {
       try {
         const messages = await taskContext.getContextMessages();
-        this.queueExtraction(context, messages);
+        this.queueExtraction(context, messages, agentId);
       } catch (error) {
         logger.warn(`cannot read conversation: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -198,15 +238,17 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async onTaskClosed(event: TaskClosedEvent, context: ExtensionContext): Promise<void> {
-    if (!this.config.enabled) return;
+    const agentId = event.task?.agentProfileId ?? (await this.agentIdFor(context));
+    const cfg = resolveConfig(this.config, agentId);
+    if (!cfg.enabled) return;
 
-    if (this.config.extraction.enabled && this.config.extraction.trigger === 'task_end') {
+    if (cfg.extraction.enabled && cfg.extraction.trigger === 'task_end') {
       const taskContext = context.getTaskContext();
       if (taskContext) {
         void (async () => {
           try {
             const messages = await taskContext.getContextMessages();
-            this.queueExtraction(context, messages);
+            this.queueExtraction(context, messages, agentId);
           } catch {
             /* task already torn down */
           }
@@ -216,7 +258,7 @@ export default class EngramMemoryExtension implements Extension {
 
     // Consolidation is driven by extraction rounds, not by wall-clock, so the
     // interval means the same thing for every trigger mode.
-    this.maybeConsolidate(context);
+    this.maybeConsolidate(context, agentId);
   }
 
   // ------------------------------------------------------------- scheduling
@@ -226,7 +268,11 @@ export default class EngramMemoryExtension implements Extension {
    * never blocked by the (potentially slow) secondary LLM. Work is serialized
    * per project so two runs cannot race on the same memories.
    */
-  private queueExtraction(context: ExtensionContext, messages: ContextMessage[]): void {
+  private queueExtraction(
+    context: ExtensionContext,
+    messages: ContextMessage[],
+    agentId?: string | null,
+  ): void {
     const projectDir = context.getProjectDir();
     if (!messages?.length) return;
     if (this.inFlight.has(projectDir)) {
@@ -237,15 +283,24 @@ export default class EngramMemoryExtension implements Extension {
     const taskId = context.getTaskContext()?.data?.id ?? '';
 
     this.enqueue(projectDir, async () => {
+      const cfg = resolveConfig(this.config, agentId);
+      logger.setConfig(cfg.logging);
+      if (hasAgentOverride(this.config, agentId)) {
+        logger.debug(`extraction using agent profile "${agentId}" overrides`);
+      }
       try {
+        if (!cfg.enabled || !cfg.extraction.enabled) {
+          logger.debug('extraction skipped - disabled for this agent');
+          return;
+        }
         const report = await runExtraction({
           context,
           messages,
           projectDir,
           taskId,
-          config: this.config,
+          config: cfg,
           state: this.state,
-          statePath: STATE_PATH,
+          statePath: this.statePath,
           signal: this.abortController.signal,
           taskContext: context.getTaskContext(),
         });
@@ -255,29 +310,39 @@ export default class EngramMemoryExtension implements Extension {
         logger.warn(`extraction error: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
         this.inFlight.delete(projectDir);
+        logger.setConfig(this.config.logging);
       }
     });
   }
 
-  private maybeConsolidate(context: ExtensionContext): void {
-    if (!this.config.enabled || !this.config.consolidation.enabled) return;
+  private maybeConsolidate(context: ExtensionContext, agentId?: string | null): void {
+    const cfg = resolveConfig(this.config, agentId);
+    if (!cfg.enabled || !cfg.consolidation.enabled) return;
     const projectDir = context.getProjectDir();
     const stats = projectStats(this.state, projectDir);
-    if (stats.tasksSinceConsolidation < Math.max(2, this.config.consolidation.interval_tasks)) return;
+    if (stats.tasksSinceConsolidation < Math.max(2, cfg.consolidation.interval_tasks)) return;
 
     this.enqueue(projectDir, async () => {
+      const effective = resolveConfig(this.config, agentId);
+      logger.setConfig(effective.logging);
       try {
+        if (!effective.enabled || !effective.consolidation.enabled) {
+          logger.debug('consolidation skipped - disabled for this agent');
+          return;
+        }
         await runConsolidation({
           context,
           projectDir,
-          config: this.config,
+          config: effective,
           state: this.state,
-          statePath: STATE_PATH,
+          statePath: this.statePath,
           signal: this.abortController.signal,
           taskContext: context.getTaskContext(),
         });
       } catch (error) {
         logger.warn(`consolidation error: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        logger.setConfig(this.config.logging);
       }
     });
   }
@@ -285,7 +350,7 @@ export default class EngramMemoryExtension implements Extension {
   private countRound(projectDir: string): void {
     const stats = projectStats(this.state, projectDir);
     stats.tasksSinceConsolidation += 1;
-    saveState(STATE_PATH, this.state);
+    saveState(this.statePath, this.state);
   }
 
   private enqueue(key: string, fn: () => Promise<void>): void {
@@ -296,6 +361,15 @@ export default class EngramMemoryExtension implements Extension {
         logger.warn(`queued job failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     this.queues.set(key, next);
+  }
+
+  /**
+   * Test seam (tests/run.ts scenario 8): await every queued extraction and
+   * consolidation without unloading the extension, so a harness can assert on
+   * the result of fire-and-forget work. AiderDesk never calls it.
+   */
+  async drainQueues(): Promise<void> {
+    await Promise.allSettled(Array.from(this.queues.values()));
   }
 
   // ---------------------------------------------------------------- commands
@@ -311,9 +385,15 @@ export default class EngramMemoryExtension implements Extension {
             ctx.log('[Memory] no task context - open a task first', 'warn');
             return;
           }
+          const agentId = await this.agentIdFor(ctx);
+          const cfg = resolveConfig(this.config, agentId);
+          if (!cfg.enabled || !cfg.extraction.enabled) {
+            taskContext.addLogMessage('info', '[Memory] extraction is disabled for this agent');
+            return;
+          }
           const messages = await taskContext.getContextMessages();
-          taskContext.addLogMessage('info', '[Memory] extraction started (background)');
-          this.queueExtraction(ctx, messages);
+          taskContext.addLogMessage('info', `[Memory] extraction started (background, agent ${agentId ?? 'global'})`);
+          this.queueExtraction(ctx, messages, agentId);
         },
       },
       {
@@ -322,20 +402,27 @@ export default class EngramMemoryExtension implements Extension {
         arguments: [{ description: 'force - run even when fewer than 2 memories' }],
         execute: async (args, ctx) => {
           const projectDir = ctx.getProjectDir();
-          ctx.getTaskContext()?.addLogMessage('info', '[Memory] consolidation started (background)');
+          const agentId = await this.agentIdFor(ctx);
+          const cfg = resolveConfig(this.config, agentId);
+          if (!cfg.enabled || !cfg.consolidation.enabled) {
+            ctx.getTaskContext()?.addLogMessage('info', '[Memory] consolidation is disabled for this agent');
+            return;
+          }
+          const force = args.includes('force');
+          ctx.getTaskContext()?.addLogMessage('info', `[Memory] consolidation started (background, agent ${agentId ?? 'global'})`);
           this.enqueue(projectDir, async () => {
             const report = await runConsolidation({
               context: ctx,
               projectDir,
               config: {
-                ...this.config,
+                ...cfg,
                 consolidation: {
-                  ...this.config.consolidation,
-                  safe_mode: args.includes('force') ? false : this.config.consolidation.safe_mode,
+                  ...cfg.consolidation,
+                  safe_mode: force ? false : cfg.consolidation.safe_mode,
                 },
               },
               state: this.state,
-              statePath: STATE_PATH,
+              statePath: this.statePath,
               taskContext: ctx.getTaskContext(),
             });
             const line = report.failure
@@ -361,18 +448,23 @@ export default class EngramMemoryExtension implements Extension {
           const global = managed.filter((entry) => (entry.projectId ?? '') === '');
           const native = all.filter((entry) => entry?.id && !isManaged(entry));
           const stats = projectStats(this.state, projectDir);
+          const agentId = await this.agentIdFor(ctx);
+          const cfg = resolveConfig(this.config, agentId);
 
           const lines = [
             `[Memory] AiderDesk entries: ${all.length} (Engram-managed ${managed.length}, native ${native.length})`,
             `[Memory] this project: ${mine.length} | global: ${global.length}`,
+            `[Memory] agent: ${agentId ?? 'none'} (${hasAgentOverride(this.config, agentId) ? 'per-agent overrides applied' : 'global config'})`,
             `[Memory] project counters: extractions ${stats.extractions}, stored ${stats.stored}, updated ${stats.updated}, duplicates ${stats.duplicates}, obsolete ${stats.obsolete}`,
             `[Memory] totals: LLM calls ${this.state.totals.llmCalls} (failures ${this.state.totals.llmFailures}), stored ${this.state.totals.stored}, updated ${this.state.totals.updated}, deleted ${this.state.totals.deleted}`,
-            `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${this.config.consolidation.interval_tasks} rounds, safe_mode=${this.config.consolidation.safe_mode}`,
-            `[Memory] secondary LLM: ${this.config.secondary_llm.model} @ ${this.config.secondary_llm.base_url}`,
+            `[Memory] extraction: enabled=${cfg.extraction.enabled} trigger=${cfg.extraction.trigger} min_importance=${cfg.extraction.min_importance}`,
+            `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories}`,
+            `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${cfg.consolidation.interval_tasks} rounds, safe_mode=${cfg.consolidation.safe_mode}`,
+            `[Memory] secondary LLM: ${cfg.secondary_llm.model} @ ${cfg.secondary_llm.base_url}`,
           ];
           for (const line of lines) ctx.getTaskContext()?.addLogMessage('info', line);
 
-          const result = await probe(this.config.secondary_llm);
+          const result = await probe(cfg.secondary_llm);
           ctx
             .getTaskContext()
             ?.addLogMessage(
@@ -398,7 +490,14 @@ export default class EngramMemoryExtension implements Extension {
             ctx.getTaskContext()?.addLogMessage('warning', '[Memory] AiderDesk Memory is disabled/unavailable');
             return;
           }
-          const candidates = await retrieveScoped(memory, ctx.getProjectDir(), query, 3, true);
+          const cfg = resolveConfig(this.config, await this.agentIdFor(ctx));
+          const candidates = await retrieveScoped(
+            memory,
+            ctx.getProjectDir(),
+            query,
+            3,
+            cfg.retrieval.include_global,
+          );
           if (!candidates.length) {
             ctx.getTaskContext()?.addLogMessage('info', '[Memory] no matching memory found');
             return;
@@ -440,7 +539,7 @@ export default class EngramMemoryExtension implements Extension {
             if (await remove(memory, entry.id)) deleted += 1;
           }
           this.state.totals.deleted += deleted;
-          saveState(STATE_PATH, this.state);
+          saveState(this.statePath, this.state);
           ctx.getTaskContext()?.addLogMessage('info', `[Memory] cleared ${deleted} project memories`);
         },
       },
@@ -453,16 +552,42 @@ export default class EngramMemoryExtension implements Extension {
     return readConfigComponent();
   }
 
-  async getConfigData(_context: ExtensionContext): Promise<unknown> {
-    return loadConfig(CONFIG_PATH);
+  async getConfigData(context: ExtensionContext): Promise<unknown> {
+    const config = loadConfig(this.configPath);
+    // `_agents` is UI-only: the list of AiderDesk agent profiles available in
+    // this project, so the settings panel can render one tab per agent.
+    // mergeConfig() ignores unknown keys, so it never reaches config.json.
+    try {
+      const profiles = (context.getProjectContext()?.getAgentProfiles() ?? [])
+        .filter((profile) => profile?.id)
+        .map((profile) => ({
+          id: profile.id,
+          name: profile.name,
+          provider: profile.provider,
+          model: profile.model,
+          isSubagent: Boolean(profile.isSubagent),
+        }));
+      return { ...config, _agents: profiles };
+    } catch (error) {
+      logger.debug(`agent profiles unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return config;
+    }
   }
 
   async saveConfigData(configData: unknown, _context: ExtensionContext): Promise<unknown> {
     const merged = mergeConfig(configData);
-    saveConfig(CONFIG_PATH, merged);
+    saveConfig(this.configPath, merged);
     this.config = merged;
     logger.setConfig(merged.logging);
-    logger.info(`configuration saved (secondary LLM: ${merged.secondary_llm.model} @ ${merged.secondary_llm.base_url})`);
+    const overrides = Object.keys(merged.agents);
+    logger.info(
+      `configuration saved (secondary LLM: ${merged.secondary_llm.model} @ ${merged.secondary_llm.base_url})`,
+    );
+    logger.info(
+      overrides.length
+        ? `per-agent overrides: ${overrides.length} (${overrides.join(', ')})`
+        : 'per-agent overrides: none (global config applies to every agent)',
+    );
     return merged;
   }
 }

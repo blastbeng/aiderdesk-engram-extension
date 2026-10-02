@@ -21,6 +21,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 - **Never blocks the agent** — fire-and-forget serialized queues; if the secondary LLM is offline, AiderDesk keeps working normally.
 - **Full UI + commands** — settings panel, `Memory: Extract Now`, `Memory: Consolidate`, `Memory: Show Statistics`, `Memory: Forget`, `Memory: Clear Project Memories`.
 - **Dual transport** — direct HTTP to any OpenAI-compatible endpoint (default), or AiderDesk's native `TaskContext.generateText`.
+- **Per-agent configuration** — one global config for every AiderDesk agent, plus optional per-agent overrides (different secondary model, different trigger, or memory off for one agent). Untouched fields always inherit the global config.
 - **Zero runtime dependencies** — plain `fetch`; no build step; TypeScript loaded directly by AiderDesk's jiti loader.
 
 ## Repository layout
@@ -29,7 +30,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 .aider-desk/extensions/engram/   ← the extension itself (copy this folder)
 ├── index.ts                     Extension: events, commands, settings UI, queues
 ├── src/                         Pipeline modules (extraction, consolidation, …)
-├── tests/                       Offline acceptance harness (7 scenarios)
+├── tests/                       Offline acceptance harness (8 scenarios)
 ├── ConfigComponent.jsx          Settings panel
 ├── package.json / tsconfig.json
 └── README.md                    Pointer to this file
@@ -124,6 +125,8 @@ Everything below was verified against the `v0.81.0` git tag of `hotovo/aider-des
 | Settings panel | `getConfigComponent()` + `getConfigData()` / `saveConfigData()` | — |
 | Logging | `context.log(message, 'info' \| 'error' \| 'warn' \| 'debug')` | ~2125 |
 | Native secondary-model call (optional) | `TaskContext.generateText(modelId, systemPrompt, prompt): Promise<string \| undefined>` | ~1751 |
+| List the agents a project can run (per-agent settings tabs) | `ExtensionContext.getAgentProfiles(): Promise<AgentProfile[]>` | ~2100 |
+| Resolve which agent a task runs (per-agent config resolution) | `TaskContext.getTaskAgentProfile(): Promise<AgentProfile \| null>`, plus `event.agentProfile?.id` (`onImportantReminders`) and `task.agentProfileId` (`onTaskClosed`) | ~1490 |
 
 ### What the API does not offer (and the workarounds used)
 
@@ -152,7 +155,7 @@ engram/
 │   ├── json.ts            zod v4 schemas + malformed-JSON recovery
 │   ├── state.ts           Statistics (state.json)
 │   └── logger.ts          Configurable [Memory] … logging
-├── tests/                 Offline harness (7 scenarios, real mock HTTP server)
+├── tests/                 Offline harness (8 scenarios, real mock HTTP server)
 └── ConfigComponent.jsx    Settings panel
 ```
 
@@ -172,7 +175,7 @@ ln -s /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules node_modules
 # 2) Typecheck (uses AiderDesk's bundled TypeScript; adjust the path to your install):
 /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 
-# 3) Run the offline test harness (7 scenarios, no real LLM needed):
+# 3) Run the offline test harness (8 scenarios, no real LLM needed):
 node tests/run.mjs
 #    equivalent: ./node_modules/.bin/jiti tests/run.ts
 ```
@@ -221,11 +224,36 @@ Notes:
     "safe_mode": true             // true: never deletes, only merges/updates
   },
   "privacy": { "redact_secrets": true },
-  "logging": { "enabled": true, "level": "info" }
+  "logging": { "enabled": true, "level": "info" },
+  "agents": {}                          // per-agent overrides, see below
 }
 ```
 
 Any OpenAI-compatible URL works: Ollama (`http://host:11434/v1`), LiteLLM, vLLM, LM Studio, OpenRouter. The `aiderdesk` transport goes through `TaskContext.generateText` (model declared in Settings → Providers → OpenAI-compatible); the extension falls back to HTTP when no TaskContext is available.
+
+### Per-agent configuration
+
+`agents` maps an **AiderDesk agent profile id** (`AgentProfile.id`, e.g. `"local"`, `"intesa"`) to a partial override of the global config. Every field is optional and **inherits from the global section when unset** — an override only contains what you explicitly changed:
+
+```jsonc
+{
+  "enabled": true,                      // global: applies to every agent
+  "secondary_llm": { "base_url": "http://192.168.1.13:4000/v1", "model": "synthetic/syn:small:text" },
+  "agents": {
+    "local": {                          // full override for the "local" agent
+      "secondary_llm": { "base_url": "http://192.168.1.29:4000/v1", "model": "small-model" },
+      "extraction": { "trigger": "task_end" }
+    },
+    "intesa": { "enabled": false }      // memory completely off for this agent
+  }
+}
+```
+
+Resolution is **global-first** (`resolveConfig()`): the global config is cloned, then the agent's validated overrides are applied section by section, field by field. An unknown or unresolvable agent id yields the global config unchanged, so a task whose agent profile cannot be determined never loses memory.
+
+- **Which agent is used** is resolved per event: `event.agentProfile.id` for prompt-time injection, `task.agentProfileId` at task close, `TaskContext.getTaskAgentProfile()` as the documented fallback for the remaining events.
+- **UI**: Settings → Extensions → Engram shows a **Global** tab plus one tab per agent profile listed in the project. A new agent tab starts in *Inherit global config*; switching it to *Custom* copies the current effective values so you change only what you want, and *Reset to inherit* deletes the override. `Memory: Show Statistics` reports which agent's config was applied.
+- **Storage**: overrides live in `config.json` under `agents`. The agent list (`_agents`) is injected into the settings UI at read time and is never persisted.
 
 ## 5. Installation (10 steps)
 
@@ -235,7 +263,14 @@ Any OpenAI-compatible URL works: Ollama (`http://host:11434/v1`), LiteLLM, vLLM,
    cp -r .aider-desk/extensions/engram ~/.aider-desk/extensions/engram
    ```
    (per-project install also works: `<project>/.aider-desk/extensions/engram`).
-3. **Restart AiderDesk**. TS extensions are loaded by jiti — no build, no `npm install`.
+
+   **Updating an existing global install — keep the live config.** When the extension is installed in the *global* extensions dir, `config.json` there is the real, working configuration for every project (endpoint, key, model, per-agent overrides), and `state.json` is its counters. Never let an update overwrite them:
+   ```bash
+   rsync -av --exclude config.json --exclude state.json --exclude node_modules \
+       .aider-desk/extensions/engram/ ~/.aider-desk/extensions/engram/
+   ```
+   Both files are gitignored in this repository, so they exist only in the install (and in the dev tree) and are never committed.
+3. **Restart AiderDesk**. TS extensions are loaded by jiti — no build, no `npm install`. The extension reads `config.json` **once at startup**, so a restart is also required after any manual edit of that file (changes made through the Settings UI apply immediately, no restart needed).
 4. **Check it loaded**: AiderDesk logs show `[Memory] extension loaded` plus a secondary-LLM probe. If Memory is disabled in AiderDesk (Settings → Memory) the extension logs a warning — enable it.
 5. **Open Settings → Extensions → Engram** and set `base_url`, `model`, `api_key` if they differ from the defaults.
 6. **Pick the extraction trigger** (`agent_end` recommended) and the consolidation interval (`interval_tasks: 20`).
@@ -258,6 +293,8 @@ Daily use is automatic — you code, Engram remembers. Manual controls (AiderDes
 
 `[Memory] …` logs: extraction started, candidates found, verdicts (new/duplicate/update), consolidation, LLM failures. No secret ever appears in logs (redaction happens upstream).
 
+Settings has one **Global** tab and one tab per AiderDesk agent profile: edit Global to change behaviour everywhere, open an agent tab to give a single agent its own secondary LLM, trigger, retrieval limits — or switch memory off for it. Untouched sections inherit Global; *Reset to inherit* removes an override.
+
 ## 7. The 6 tests (offline harness included)
 
 The `tests/` folder contains an **offline** harness that runs the real pipeline (extraction, classification, consolidation, redaction, repair, transport) against a **real mock OpenAI-compatible HTTP server** and a simulated **MemoryContext** (same `projectId` filtering semantics as the native API).
@@ -276,6 +313,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | 5 | Secondary LLM off | Extraction without exception, `unreachable/timeout` failure counted, store empty, agent keeps working |
 | 6 | 20+ redundant memories → consolidation | safe_mode pass: merged without deletion; aggressive pass: redundancies deleted, all 4 distinct facts survive |
 | 7 | (bonus) native `aiderdesk` transport | Every call routed to `model_id` via `generateText`, 0 HTTP requests |
+| 8 | Per-agent config | Global config applies to every agent; an override wins for its agent only — different endpoint for one agent, memory off for another, untouched sections inherit |
 
 ## 8. Troubleshooting
 
@@ -288,6 +326,9 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | `generateText … returned no text` (aiderdesk transport) | `model_id` missing in Settings → Models | Create the provider/model or switch back to `transport: "http"` |
 | Extraction timeouts | Slow model on 12 GB | Lower `extraction.max_input_tokens` or raise `timeout_ms` |
 | Nothing is written at all | Candidate importance < `min_importance` | Lower `min_importance` to 2, check `debug` logs |
+| `response has no chat completion content (finish_reason=length)` | Reasoning model spending the whole budget on `reasoning_content` | Raise `secondary_llm.max_tokens` (≥ 4096; 8192 default is comfortable) |
+| `Memory: Show Statistics` shows every LLM call failing after you edited `config.json` by hand | Config is read once at startup; the running process still uses the old endpoint | Restart AiderDesk (Settings-UI saves apply immediately — no restart needed) |
+| A per-agent override seems ignored | Agent id mismatch (override keyed by `AgentProfile.id`, not display name), or the agent tab is in *Inherit* mode | Open the agent's tab (its id is shown there), switch it to *Custom*, save; `Memory: Show Statistics` prints which agent's config was applied |
 
 ## 9. Known limitations (honesty section)
 
@@ -296,6 +337,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 - **Injection via `onImportantReminders`**: the block arrives with the reminders (in the user message, inside `<ThisIsImportant>`), not in the system prompt — the 0.81.0 API offers no alternative.
 - **Consolidation in batches**: ~9,000-token budget per batch, oldest memories first; beyond that, remaining batches run on the next cycle.
 - **`prompt_end` as trigger**: fires often, so it costs more secondary-LLM calls; `agent_end` is recommended.
+- **Per-agent overrides need a resolvable agent id**: the id comes from the event payload or `TaskContext.getTaskAgentProfile()`. When neither is available (rare, e.g. a command invoked without a task context) the global config is used — memory degrades to global, never to nothing. The settings tabs list only the agent profiles AiderDesk reports for the current project.
 
 ## 10. Privacy
 

@@ -12,6 +12,9 @@
  *
  * Scenarios 1-6 map 1:1 to the six acceptance tests requested for this
  * extension. Scenario 7 is a bonus check for the native 'aiderdesk' transport.
+ * Scenario 8 drives the extension class itself (through its testPaths seam) to
+ * check the per-agent configuration: global config for every agent, an agent
+ * override for one agent only.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -19,13 +22,13 @@
  * or:
  *   node tests/run.mjs
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ContextMessage } from '@aiderdesk/extensions';
+import type { AgentFinishedEvent, ContextMessage } from '@aiderdesk/extensions';
 
-import { mergeConfig, type EngramConfig } from '../src/config';
+import { hasAgentOverride, mergeConfig, resolveConfig, type EngramConfig } from '../src/config';
 import { logger } from '../src/logger';
 import { runExtraction, type ExtractionReport } from '../src/extraction';
 import { runConsolidation } from '../src/consolidation';
@@ -38,6 +41,7 @@ import { probe } from '../src/llm';
 import { startMockLlm, scriptedResponder, type MockServer, type Responder } from './mock-server';
 import { MockMemoryContext } from './mock-memory';
 import { createLogSink, mockExtensionContext, mockTaskContext } from './mock-context';
+import EngramMemoryExtension from '../index';
 
 // ------------------------------------------------------------------ helpers
 
@@ -502,6 +506,115 @@ async function main(): Promise<void> {
       check(calls.length >= 2, `expected >= 2 generateText calls, got ${calls.length}`);
       check(calls.every((id) => id === 'local-secondary/engram'), 'every call must target the configured secondary model id, never the main model');
     } finally {
+      await h.close();
+    }
+  });
+
+  // -------------------------------------------------------------- scenario 8
+  await scenario('8. Per-agent config: global applies to every agent, an override wins for that agent only', async () => {
+    const h = await makeHarness(scriptedResponder());
+    const dir = mkdtempSync(join(tmpdir(), 'engram-agent-'));
+    const configPath = join(dir, 'config.json');
+    const agentStatePath = join(dir, 'state.json');
+    const logMessages: string[] = [];
+
+    // Global config: everything on. Agent "sub" is switched off; agent "strict"
+    // overrides only one field and must inherit the rest.
+    writeFileSync(
+      configPath,
+      JSON.stringify({ ...h.config, agents: { sub: { enabled: false }, strict: { extraction: { min_importance: 5 } } } }, null, 2),
+      'utf-8',
+    );
+
+    EngramMemoryExtension.testPaths = { configPath, statePath: agentStatePath };
+    try {
+      const ext = new EngramMemoryExtension();
+      const profiles = [{ id: 'local', name: 'Local' }, { id: 'sub', name: 'Subagent' }, { id: 'strict', name: 'Strict' }];
+
+      const ctxFor = (agentId: string | null): ReturnType<typeof mockExtensionContext> =>
+        mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: profiles,
+          taskContext: mockTaskContext({
+            id: `task-${agentId ?? 'none'}`,
+            agentProfile: agentId ? { id: agentId, name: agentId } : null,
+            logMessages,
+          }),
+        });
+
+      const agentFinished = (messages: ContextMessage[]): AgentFinishedEvent =>
+        ({ mode: 'agent', aborted: false, contextMessages: messages, resultMessages: [] }) as AgentFinishedEvent;
+
+      await ext.onLoad(ctxFor('local'));
+
+      // 1. An agent with no override runs the global config and stores a memory.
+      await ext.onAgentFinished(agentFinished(LLAMA_CONVERSATION()), ctxFor('local'));
+      await ext.drainQueues();
+      check(h.memory.count() === 1, `expected 1 memory from the global-config agent, got ${h.memory.count()}`);
+
+      // 2. The same conversation from a disabled agent stores nothing and does
+      //    not even contact the secondary LLM.
+      const callsBefore = h.server.requests.length;
+      check(callsBefore >= 1, 'the global-config agent must have contacted the secondary LLM');
+      await ext.onAgentFinished(agentFinished(LLAMA_CONVERSATION()), ctxFor('sub'));
+      await ext.drainQueues();
+      check(h.memory.count() === 1, `a disabled agent must store nothing, store now has ${h.memory.count()}`);
+      check(
+        h.server.requests.length === callsBefore,
+        `the disabled agent must not contact the secondary LLM (${h.server.requests.length - callsBefore} extra calls)`,
+      );
+
+      // 3. The settings panel receives the project's agent profiles, and the
+      //    overrides survive the save/load round-trip without leaking _agents.
+      const panel = (await ext.getConfigData(ctxFor('local'))) as EngramConfig & {
+        _agents?: { id: string }[];
+      };
+      check(
+        Array.isArray(panel._agents) && panel._agents.map((a) => a.id).join(',') === 'local,sub,strict',
+        `_agents must list the project agent profiles, got ${JSON.stringify(panel._agents)}`,
+      );
+      check(panel.agents?.sub?.enabled === false, 'getConfigData lost the per-agent override');
+
+      const saved = (await ext.saveConfigData(
+        { ...panel, agents: { ...panel.agents, sub: { extraction: { min_importance: 5 } } } },
+        ctxFor('local'),
+      )) as EngramConfig;
+      check(saved.agents?.sub?.extraction?.min_importance === 5, 'saveConfigData did not persist the per-agent override');
+      check(saved.agents?.strict?.extraction?.min_importance === 5, 'saveConfigData dropped an untouched per-agent override');
+      check((saved as unknown as Record<string, unknown>)._agents === undefined, '_agents must not reach the saved config');
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      check(persisted._agents === undefined, '_agents leaked into config.json');
+      check(
+        (persisted.agents as Record<string, { extraction?: { min_importance?: number } }>)?.sub?.extraction
+          ?.min_importance === 5,
+        'config.json lost the per-agent override',
+      );
+
+      // 4. Resolution semantics: set fields win, unset fields inherit.
+      const resolved = resolveConfig(saved, 'strict');
+      check(resolved.extraction.min_importance === 5, 'resolveConfig must apply the per-agent field');
+      check(resolved.extraction.max_messages === saved.extraction.max_messages, 'resolveConfig must inherit unset fields');
+      check(
+        resolved.secondary_llm.base_url === saved.secondary_llm.base_url,
+        'resolveConfig must inherit the whole untouched section',
+      );
+      check(resolved.enabled === saved.enabled, 'resolveConfig must inherit the enabled switch');
+      check(resolveConfig(saved, 'no-such-agent') === saved, 'an unknown agent must yield the global config unchanged');
+      check(resolveConfig(saved, null) === saved, 'a null agent must yield the global config unchanged');
+      check(hasAgentOverride(saved, 'sub') && !hasAgentOverride(saved, 'local'), 'hasAgentOverride disagrees with the config');
+
+      // 5. The per-agent config is what the commands report.
+      await ext.getCommands(ctxFor('strict')).find((c) => c.name === 'memory:stats')!.execute([], ctxFor('strict'));
+      check(
+        logMessages.some((l) => l.includes('agent: strict') && l.includes('per-agent overrides applied')),
+        `memory:stats must report the agent scope, got: ${logMessages.join(' | ')}`,
+      );
+
+      await ext.onUnload();
+      check(existsSync(agentStatePath), 'onUnload did not persist the per-agent state file');
+    } finally {
+      EngramMemoryExtension.testPaths = null;
+      rmSync(dir, { recursive: true, force: true });
       await h.close();
     }
   });

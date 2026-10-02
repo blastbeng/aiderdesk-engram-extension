@@ -7,6 +7,12 @@
  * The secondary LLM is a plain OpenAI-compatible HTTP endpoint (llama-server,
  * Ollama /v1, LiteLLM, OpenRouter, ...). It is reached directly over HTTP by
  * this extension and is NEVER the AiderDesk main model.
+ *
+ * Per-agent configuration: `agents` maps an AiderDesk agent profile id
+ * (AgentProfile.id, as returned by ExtensionContext.getAgentProfiles() /
+ * getTaskAgentProfile()) to a partial override of the global config.
+ * Resolution is global-first: every unset field inherits from the global
+ * sections; only explicitly set fields override. See resolveConfig().
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
@@ -110,6 +116,25 @@ export interface LoggingConfig {
   level: 'debug' | 'info' | 'warn' | 'error';
 }
 
+/**
+ * Per-agent override block, keyed by AiderDesk AgentProfile.id.
+ *
+ * Every field is optional and inherits from the global section when unset.
+ * Only the fields you set are applied on top of the global config, so an
+ * agent can, for example, use a different secondary model while inheriting
+ * everything else, or disable memory entirely.
+ */
+export interface AgentOverrides {
+  /** Master switch for this agent. Unset = inherit the global `enabled`. */
+  enabled?: boolean;
+  secondary_llm?: Partial<SecondaryLlmConfig>;
+  extraction?: Partial<ExtractionConfig>;
+  retrieval?: Partial<RetrievalConfig>;
+  consolidation?: Partial<ConsolidationConfig>;
+  privacy?: Partial<PrivacyConfig>;
+  logging?: Partial<LoggingConfig>;
+}
+
 export interface EngramConfig {
   enabled: boolean;
   secondary_llm: SecondaryLlmConfig;
@@ -118,6 +143,11 @@ export interface EngramConfig {
   consolidation: ConsolidationConfig;
   privacy: PrivacyConfig;
   logging: LoggingConfig;
+  /**
+   * Per-agent overrides keyed by AiderDesk agent profile id
+   * (e.g. "local", "intesa", ...). Empty object = global config for all agents.
+   */
+  agents: Record<string, AgentOverrides>;
 }
 
 export const DEFAULT_CONFIG: EngramConfig = {
@@ -160,10 +190,90 @@ export const DEFAULT_CONFIG: EngramConfig = {
     enabled: true,
     level: 'info',
   },
+  agents: {},
 };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+const isString = (v: unknown): boolean => typeof v === 'string';
+const isNumber = (v: unknown): boolean => typeof v === 'number' && Number.isFinite(v);
+const isBoolean = (v: unknown): boolean => typeof v === 'boolean';
+const isTransport = (v: unknown): boolean => v === 'http' || v === 'aiderdesk';
+const isTrigger = (v: unknown): boolean => v === 'agent_end' || v === 'task_end' || v === 'prompt_end';
+const isLogLevel = (v: unknown): boolean => v === 'debug' || v === 'info' || v === 'warn' || v === 'error';
+
+/**
+ * The config sections that can be overridden per agent. Keyed validators so
+ * the global merge and the per-agent merge accept exactly the same fields
+ * with exactly the same types.
+ */
+const SECTION_KEYS = {
+  secondary_llm: {
+    transport: isTransport,
+    model_id: isString,
+    base_url: isString,
+    api_key: isString,
+    model: isString,
+    temperature: isNumber,
+    max_tokens: isNumber,
+    timeout_ms: isNumber,
+    headers: isPlainObject,
+  },
+  extraction: {
+    enabled: isBoolean,
+    trigger: isTrigger,
+    max_messages: isNumber,
+    min_importance: isNumber,
+    max_input_tokens: isNumber,
+    max_candidates: isNumber,
+    max_existing_for_dedup: isNumber,
+  },
+  retrieval: {
+    enabled: isBoolean,
+    max_memories: isNumber,
+    min_relevance: isNumber,
+    include_global: isBoolean,
+  },
+  consolidation: {
+    enabled: isBoolean,
+    interval_tasks: isNumber,
+    safe_mode: isBoolean,
+  },
+  privacy: {
+    redact_secrets: isBoolean,
+  },
+  logging: {
+    enabled: isBoolean,
+    level: isLogLevel,
+  },
+} as const;
+
+type SectionName = keyof typeof SECTION_KEYS;
+const SECTION_NAMES = Object.keys(SECTION_KEYS) as SectionName[];
+
+/** Copy every field from `src` that passes its validator onto `target`. */
+function applySection(target: Record<string, unknown>, src: Record<string, unknown>, key: SectionName): void {
+  for (const [field, valid] of Object.entries(SECTION_KEYS[key])) {
+    const value = src[field];
+    if (valid(value)) target[field] = value;
+  }
+}
+
+/** Validate one per-agent override block. Drops unknown agents' junk silently. */
+function mergeAgentOverride(raw: unknown): AgentOverrides | null {
+  if (!isPlainObject(raw)) return null;
+  const ov: Record<string, unknown> = {};
+  if (typeof raw.enabled === 'boolean') ov.enabled = raw.enabled;
+  for (const section of SECTION_NAMES) {
+    const src = raw[section];
+    if (!isPlainObject(src)) continue;
+    const target: Record<string, unknown> = {};
+    applySection(target, src, section);
+    if (Object.keys(target).length) ov[section] = target;
+  }
+  return Object.keys(ov).length ? (ov as AgentOverrides) : null;
 }
 
 /**
@@ -179,61 +289,53 @@ export function mergeConfig(raw: unknown): EngramConfig {
 
   if (typeof r.enabled === 'boolean') base.enabled = r.enabled;
 
-  if (isPlainObject(r.secondary_llm)) {
-    const s = r.secondary_llm as Record<string, unknown>;
-    if (s.transport === 'http' || s.transport === 'aiderdesk') base.secondary_llm.transport = s.transport;
-    if (typeof s.model_id === 'string') base.secondary_llm.model_id = s.model_id.trim();
-    if (typeof s.base_url === 'string') base.secondary_llm.base_url = s.base_url.trim();
-    if (typeof s.api_key === 'string') base.secondary_llm.api_key = s.api_key;
-    if (typeof s.model === 'string') base.secondary_llm.model = s.model.trim();
-    if (typeof s.temperature === 'number') base.secondary_llm.temperature = s.temperature;
-    if (typeof s.max_tokens === 'number') base.secondary_llm.max_tokens = s.max_tokens;
-    if (typeof s.timeout_ms === 'number') base.secondary_llm.timeout_ms = s.timeout_ms;
-    if (isPlainObject(s.headers)) base.secondary_llm.headers = s.headers as Record<string, string>;
-  }
-
-  if (isPlainObject(r.extraction)) {
-    const e = r.extraction as Record<string, unknown>;
-    if (typeof e.enabled === 'boolean') base.extraction.enabled = e.enabled;
-    if (e.trigger === 'agent_end' || e.trigger === 'task_end' || e.trigger === 'prompt_end') {
-      base.extraction.trigger = e.trigger;
+  for (const section of SECTION_NAMES) {
+    const src = r[section];
+    if (isPlainObject(src)) {
+      applySection(base[section] as unknown as Record<string, unknown>, src, section);
     }
-    if (typeof e.max_messages === 'number') base.extraction.max_messages = e.max_messages;
-    if (typeof e.min_importance === 'number') base.extraction.min_importance = e.min_importance;
-    if (typeof e.max_input_tokens === 'number') base.extraction.max_input_tokens = e.max_input_tokens;
-    if (typeof e.max_candidates === 'number') base.extraction.max_candidates = e.max_candidates;
-    if (typeof e.max_existing_for_dedup === 'number') base.extraction.max_existing_for_dedup = e.max_existing_for_dedup;
   }
 
-  if (isPlainObject(r.retrieval)) {
-    const c = r.retrieval as Record<string, unknown>;
-    if (typeof c.enabled === 'boolean') base.retrieval.enabled = c.enabled;
-    if (typeof c.max_memories === 'number') base.retrieval.max_memories = c.max_memories;
-    if (typeof c.min_relevance === 'number') base.retrieval.min_relevance = c.min_relevance;
-    if (typeof c.include_global === 'boolean') base.retrieval.include_global = c.include_global;
-  }
-
-  if (isPlainObject(r.consolidation)) {
-    const c = r.consolidation as Record<string, unknown>;
-    if (typeof c.enabled === 'boolean') base.consolidation.enabled = c.enabled;
-    if (typeof c.interval_tasks === 'number') base.consolidation.interval_tasks = c.interval_tasks;
-    if (typeof c.safe_mode === 'boolean') base.consolidation.safe_mode = c.safe_mode;
-  }
-
-  if (isPlainObject(r.privacy)) {
-    const p = r.privacy as Record<string, unknown>;
-    if (typeof p.redact_secrets === 'boolean') base.privacy.redact_secrets = p.redact_secrets;
-  }
-
-  if (isPlainObject(r.logging)) {
-    const l = r.logging as Record<string, unknown>;
-    if (typeof l.enabled === 'boolean') base.logging.enabled = l.enabled;
-    if (l.level === 'debug' || l.level === 'info' || l.level === 'warn' || l.level === 'error') {
-      base.logging.level = l.level;
+  if (isPlainObject(r.agents)) {
+    for (const [rawId, rawOverride] of Object.entries(r.agents as Record<string, unknown>)) {
+      const id = rawId.trim();
+      if (!id) continue;
+      const ov = mergeAgentOverride(rawOverride);
+      if (ov) base.agents[id] = ov;
     }
   }
 
   return base;
+}
+
+/**
+ * Resolve the effective config for one agent.
+ *
+ * Global-first inheritance: the returned object is the global config with the
+ * agent's validated overrides applied on top, field by field. An unknown or
+ * null agent id yields the global config unchanged.
+ *
+ * Returns the shared config object when there is no override for the agent -
+ * callers treat config as read-only (they never mutate it in place).
+ */
+export function resolveConfig(config: EngramConfig, agentId?: string | null): EngramConfig {
+  const override = agentId ? config.agents?.[agentId] : undefined;
+  if (!override) return config;
+
+  const out: EngramConfig = structuredClone(config);
+  if (typeof override.enabled === 'boolean') out.enabled = override.enabled;
+  for (const section of SECTION_NAMES) {
+    const src = override[section];
+    if (isPlainObject(src)) {
+      Object.assign(out[section] as unknown as Record<string, unknown>, src);
+    }
+  }
+  return out;
+}
+
+/** True when this agent id has any override configured. */
+export function hasAgentOverride(config: EngramConfig, agentId?: string | null): boolean {
+  return Boolean(agentId && config.agents?.[agentId]);
 }
 
 export function loadConfig(configPath: string): EngramConfig {

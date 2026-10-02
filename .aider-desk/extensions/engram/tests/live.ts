@@ -14,8 +14,8 @@
  *   PART 3  - command callability: a COLD INSTALL of the extension into a
  *             temp directory (exactly like ~/.aider-desk/extensions/engram),
  *             loaded through jiti, then every /memory:* command executed for
- *             real against the live endpoint, plus the settings round-trip,
- *             the reminder-injection path and onUnload.
+ *             real against the live endpoint, plus the settings round-trip
+ *             (global and per-agent), the reminder-injection path and onUnload.
  *
  * Secrets never touch the repository: endpoint, key and model come from
  * environment variables and are written only to a temp config.json that is
@@ -27,7 +27,7 @@
  *   ENGRAM_LIVE_MODEL=synthetic/syn:small:text \
  *   node tests/live.mjs
  */
-import { cpSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -410,6 +410,41 @@ async function main(): Promise<void> {
   }
   if (reloaded?.secondary_llm?.api_key !== LIVE_KEY) throw new Error('api_key was lost in the config round-trip');
   console.log('PASS saveConfigData/getConfigData round-trip');
+
+  // Per-agent config: the settings payload carries the project's agent profiles
+  // as `_agents`, an override persists, and `_agents` never reaches config.json.
+  const ctxAgents = mockExtensionContext(memoryB, '/tmp/engram-live-project-b', {
+    taskContext,
+    sink: sinkB,
+    agentProfiles: [
+      { id: 'local', name: 'Local' },
+      { id: 'intesa', name: 'Intesa', provider: 'openai-compatible', model: 'engram-secondary' },
+    ],
+  });
+  const panel = (await ext.getConfigData(ctxAgents)) as EngramConfig & { _agents?: { id: string }[] };
+  if (!Array.isArray(panel._agents) || panel._agents.map((a) => a.id).join(',') !== 'local,intesa') {
+    throw new Error(`_agents missing from the settings payload: ${JSON.stringify(panel._agents)}`);
+  }
+  // A context with no project context must degrade to the plain global config.
+  const plainPanel = (await ext.getConfigData(ctxB)) as EngramConfig & { _agents?: unknown };
+  if (plainPanel._agents !== undefined) throw new Error('_agents must be absent when no project context is available');
+
+  const savedAgents = (await ext.saveConfigData(
+    { ...panel, agents: { intesa: { extraction: { min_importance: 4 }, secondary_llm: { model: LIVE_MODEL } } } },
+    ctxAgents,
+  )) as EngramConfig;
+  if (savedAgents.agents?.intesa?.extraction?.min_importance !== 4) {
+    throw new Error(`the per-agent override was not saved: ${JSON.stringify(savedAgents.agents)}`);
+  }
+  const persistedConfig = JSON.parse(readFileSync(join(tempDir, 'config.json'), 'utf-8')) as Record<string, unknown>;
+  if (persistedConfig._agents !== undefined) throw new Error('_agents leaked into config.json');
+  if (
+    (persistedConfig.agents as Record<string, { extraction?: { min_importance?: number } }>)?.intesa?.extraction
+      ?.min_importance !== 4
+  ) {
+    throw new Error('config.json lost the per-agent override');
+  }
+  console.log('PASS per-agent settings (_agents listed, override persisted, _agents not persisted)');
 
   const jsx = ext.getConfigComponent(ctxB);
   if (typeof jsx !== 'string' || jsx.length < 100) throw new Error('getConfigComponent returned no JSX');
