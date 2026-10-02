@@ -1,0 +1,14 @@
+# Aider CLI session artifacts
+.aider*
+!.aider-desk/
+
+# AiderDesk app-internal data (tasks, agents, prompts, commands) — keep only extensions
+.aider-desk/*
+!.aider-desk/extensions/
+.aider-desk/extensions/*
+!.aider-desk/extensions/engram/
+
+# Engram runtime state and dev symlink (never commit)
+.aider-desk/extensions/engram/config.json
+.aider-desk/extensions/engram/state.json
+.aider-desk/extensions/engram/node_modules
