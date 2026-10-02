@@ -96,6 +96,12 @@ export interface RetrievalConfig {
    * used as a best-effort client-side hint (see retrieval.ts). It never blocks retrieval.
    */
   min_relevance: number;
+  /**
+   * Importance floor (1..5) for injection: memories below it are never added to
+   * the context, regardless of vector similarity. Independent of the extraction
+   * floor, so you can store liberally and inject selectively.
+   */
+  min_importance: number;
   /** Include global-scope memories (projectId === '') alongside project memories. */
   include_global: boolean;
 }
@@ -178,6 +184,7 @@ export const DEFAULT_CONFIG: EngramConfig = {
     enabled: true,
     max_memories: 8,
     min_relevance: 0.65,
+    min_importance: 3,
     include_global: true,
   },
   consolidation: {
@@ -236,6 +243,7 @@ const SECTION_KEYS = {
     enabled: isBoolean,
     max_memories: isNumber,
     min_relevance: isNumber,
+    min_importance: isNumber,
     include_global: isBoolean,
   },
   consolidation: {
@@ -340,14 +348,26 @@ export function hasAgentOverride(config: EngramConfig, agentId?: string | null):
   return Boolean(agentId && config.agents?.[agentId]);
 }
 
+/**
+ * Environment override: when ENGRAM_API_KEY is set and non-blank, it replaces
+ * the stored secondary-LLM API key, so a deployment can keep the secret out of
+ * config.json entirely. Per-agent overrides that set their own api_key still
+ * win: resolveConfig() applies them on top of the merged global config.
+ */
+function applyApiKeyEnv(config: EngramConfig): EngramConfig {
+  const fromEnv = process.env.ENGRAM_API_KEY?.trim();
+  if (fromEnv) config.secondary_llm.api_key = fromEnv;
+  return config;
+}
+
 export function loadConfig(configPath: string): EngramConfig {
   try {
-    if (!existsSync(configPath)) return structuredClone(DEFAULT_CONFIG);
+    if (!existsSync(configPath)) return applyApiKeyEnv(structuredClone(DEFAULT_CONFIG));
     const text = readFileSync(configPath, 'utf-8');
     const parsed = JSON.parse(text);
-    return mergeConfig(parsed);
+    return applyApiKeyEnv(mergeConfig(parsed));
   } catch {
-    return structuredClone(DEFAULT_CONFIG);
+    return applyApiKeyEnv(structuredClone(DEFAULT_CONFIG));
   }
 }
 

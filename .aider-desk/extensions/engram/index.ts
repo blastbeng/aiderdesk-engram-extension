@@ -40,6 +40,7 @@ import { runExtraction } from './src/extraction';
 import { runConsolidation } from './src/consolidation';
 import { retrieveForPrompt, stripBlock, wrapBlock } from './src/retrieval';
 import {
+  deterministicDedup,
   getMemoryContextSafely,
   importanceOf,
   isManaged,
@@ -439,6 +440,29 @@ export default class EngramMemoryExtension implements Extension {
         },
       },
       {
+        name: 'memory:dedup',
+        description: 'Engram: remove exact duplicate memories deterministically (no LLM involved)',
+        execute: async (_args, ctx) => {
+          const memory = getMemoryContextSafely(ctx);
+          if (!memory) {
+            ctx.getTaskContext()?.addLogMessage('warning', '[Memory] AiderDesk Memory is disabled/unavailable');
+            return;
+          }
+          const projectDir = ctx.getProjectDir();
+          this.enqueue(projectDir, async () => {
+            const report = await deterministicDedup(memory);
+            this.state.totals.deleted += report.removed;
+            saveState(this.statePath, this.state);
+            ctx
+              .getTaskContext()
+              ?.addLogMessage(
+                'info',
+                `[Memory] dedup: scanned ${report.scanned} managed memories, removed ${report.removed} exact duplicate(s)`,
+              );
+          });
+        },
+      },
+      {
         name: 'memory:stats',
         description: 'Engram: show memory statistics and secondary LLM status',
         execute: async (_args, ctx) => {
@@ -464,7 +488,7 @@ export default class EngramMemoryExtension implements Extension {
             `[Memory] project counters: extractions ${stats.extractions}, stored ${stats.stored}, updated ${stats.updated}, duplicates ${stats.duplicates}, obsolete ${stats.obsolete}`,
             `[Memory] totals: LLM calls ${this.state.totals.llmCalls} (failures ${this.state.totals.llmFailures}), stored ${this.state.totals.stored}, updated ${this.state.totals.updated}, deleted ${this.state.totals.deleted}`,
             `[Memory] extraction: enabled=${cfg.extraction.enabled} trigger=${cfg.extraction.trigger} min_importance=${cfg.extraction.min_importance}`,
-            `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories}`,
+            `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories} min_importance=${cfg.retrieval.min_importance}`,
             `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${cfg.consolidation.interval_tasks} rounds, safe_mode=${cfg.consolidation.safe_mode}`,
             `[Memory] secondary LLM: ${cfg.secondary_llm.model} @ ${cfg.secondary_llm.base_url}`,
           ];

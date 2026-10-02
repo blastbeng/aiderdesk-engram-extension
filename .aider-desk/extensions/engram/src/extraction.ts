@@ -47,6 +47,16 @@ import {
 import { logger } from './logger';
 import { projectStats, saveState, type EngramState } from './state';
 
+/**
+ * Time-bound phrasing that can never be durable: a memory that is only true
+ * "today"/"tonight"/"right now" is noise next week. The extraction prompt
+ * already forbids it; this is the deterministic backstop for when the model
+ * writes one anyway. Genuinely time-dependent facts survive by phrasing the
+ * time context explicitly ("As of 2026-10, ..."), which this regex ignores.
+ */
+const TRANSIENT_PHRASE_RE =
+  /\b(today|yesterday|tonight|this morning|this afternoon|this evening|right now|just now|at the moment|this session|earlier today)\b/i;
+
 export interface ExtractionReport {
   candidates: number;
   stored: number;
@@ -195,6 +205,11 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
   for (const candidate of parsed.data!.memories) {
     if (candidate.importance < config.extraction.min_importance) {
       report.skipped += 1;
+      continue;
+    }
+    if (TRANSIENT_PHRASE_RE.test(candidate.content)) {
+      report.skipped += 1;
+      logger.debug(`dropped a time-bound candidate: ${candidate.content.slice(0, 80)}`);
       continue;
     }
     if (looksSecret(candidate.content, config.privacy.redact_secrets)) {

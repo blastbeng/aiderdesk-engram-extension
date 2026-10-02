@@ -24,6 +24,7 @@ ${CATEGORIES.map((c) => `- ${c}`).join('\n')}
 - Trivial, obvious, or transient state (a file was edited, a command was run, a test passed).
 - Restatements of the user's immediate request.
 - Secrets of any kind: passwords, API keys, tokens, cookies, private keys, connection strings with credentials. If a fact is only meaningful with a secret attached, drop the fact.
+- Time-bound chatter phrased around "today", "tonight", "right now", "this session": a memory must still be true next week. If a fact is genuinely time-dependent, state the time context explicitly (e.g. "As of 2026-10, ...") instead of anchoring it to the current moment.
 - Personal data that is not a durable preference.
 
 ## Rules

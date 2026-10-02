@@ -14,7 +14,8 @@
  * extension. Scenario 7 is a bonus check for the native 'aiderdesk' transport.
  * Scenario 8 drives the extension class itself (through its testPaths seam) to
  * check the per-agent configuration: global config for every agent, an agent
- * override for one agent only.
+ * override for one agent only. Scenario 9 covers relevance-primary retrieval
+ * with the retrieval.min_importance floor and the deterministic dedup command.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -34,7 +35,7 @@ import { runExtraction, type ExtractionReport } from '../src/extraction';
 import { runConsolidation } from '../src/consolidation';
 import { retrieveForPrompt } from '../src/retrieval';
 import { decodeMemory } from '../src/memory-format';
-import { importanceOf, metaForNew, statementOf } from '../src/store';
+import { deterministicDedup, importanceOf, metaForNew, statementOf } from '../src/store';
 import { loadState, type EngramState } from '../src/state';
 import { probe } from '../src/llm';
 
@@ -615,6 +616,94 @@ async function main(): Promise<void> {
     } finally {
       EngramMemoryExtension.testPaths = null;
       rmSync(dir, { recursive: true, force: true });
+      await h.close();
+    }
+  });
+
+  await scenario('9. Retrieval is relevance-primary with an importance floor, and deterministic dedup removes exact duplicates', async () => {
+    const h = await makeHarness(scriptedResponder());
+    try {
+      // Part A - deterministic dedup: three copies of one fact (importance
+      // 2/4/3) plus one distinct fact; the two weaker copies must go.
+      const copies: { statement: string; importance: number }[] = [
+        { statement: 'The deployment runs on the green cluster.', importance: 2 },
+        { statement: 'The deployment runs on the green cluster.', importance: 4 },
+        { statement: 'The deployment runs on the green cluster.', importance: 3 },
+      ];
+      for (let i = 0; i < copies.length; i++) {
+        await h.memory.storeMemory(
+          h.projectDir,
+          `dup-${i}`,
+          'code-pattern',
+          encodeForHarness(copies[i].statement, {
+            category: 'configuration',
+            importance: copies[i].importance,
+            scope: 'project',
+            confidence: 0.8,
+          }),
+        );
+      }
+      await h.memory.storeMemory(
+        h.projectDir,
+        'distinct-0',
+        'code-pattern',
+        encodeForHarness('Staging deploys every night at 03:00 UTC.', {
+          category: 'configuration',
+          importance: 4,
+          scope: 'project',
+          confidence: 0.9,
+        }),
+      );
+
+      const report = await deterministicDedup(h.memory);
+      check(report.scanned === 4, `dedup must scan 4 managed memories, scanned ${report.scanned}`);
+      check(report.removed === 2, `dedup must remove 2 exact duplicates, removed ${report.removed}`);
+      check(h.memory.count() === 2, `store must hold 2 memories after dedup, has ${h.memory.count()}`);
+      const survivors = h.memory
+        .statements()
+        .map((content) => decodeMemory(content))
+        .filter((m) => m !== null);
+      check(
+        survivors.some((m) => m.meta.importance === 4 && /green cluster/.test(m.statement)),
+        'the highest-importance copy of the duplicated fact must survive',
+      );
+      check(survivors.some((m) => /Staging deploys/.test(m.statement)), 'the distinct fact must survive');
+
+      const again = await deterministicDedup(h.memory);
+      check(again.removed === 0, 'a second dedup pass must remove nothing (idempotence)');
+
+      // Part B - relevance-primary retrieval with the importance floor
+      // (retrieval.min_importance defaults to 3 in the harness config).
+      h.memory.reset();
+      await h.memory.storeMemory(
+        h.projectDir,
+        'low-0',
+        'code-pattern',
+        encodeForHarness('The deployment runs on the green cluster.', {
+          category: 'configuration',
+          importance: 2,
+          scope: 'project',
+          confidence: 0.9,
+        }),
+      );
+      const none = await retrieveForPrompt(h.context, h.projectDir, 'which cluster does the deployment run on?', h.config);
+      check(none.block === null, 'a below-floor memory must not be injected even when it is the best match');
+
+      await h.memory.storeMemory(
+        h.projectDir,
+        'ok-0',
+        'code-pattern',
+        encodeForHarness('The deployment runs on the green cluster with blue workers.', {
+          category: 'configuration',
+          importance: 3,
+          scope: 'project',
+          confidence: 0.9,
+        }),
+      );
+      const some = await retrieveForPrompt(h.context, h.projectDir, 'which cluster does the deployment run on?', h.config);
+      check(some.block !== null && some.count === 1, `an at-floor memory must be injected, got count=${some.count}`);
+      check(/green cluster with blue workers/.test(some.block ?? ''), 'the injected statement must not carry the footer');
+    } finally {
       await h.close();
     }
   });

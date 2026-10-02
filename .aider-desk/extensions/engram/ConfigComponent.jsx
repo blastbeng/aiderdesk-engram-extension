@@ -329,10 +329,16 @@
               placeholder="8"
             />
             <Input
-              label="Min importance to inject"
+              label="Min relevance (hint)"
               value={String(retrieval.min_relevance ?? 0.65)}
               onChange={(e) => setRetrieval({ min_relevance: float(e.target.value, 0.65) })}
               placeholder="0.65"
+            />
+            <Input
+              label="Min importance to inject"
+              value={String(retrieval.min_importance ?? 3)}
+              onChange={(e) => setRetrieval({ min_importance: num(e.target.value, 3) })}
+              placeholder="3"
             />
           </div>
           <Checkbox
@@ -341,9 +347,9 @@
             onChange={(checked) => setRetrieval({ include_global: checked })}
           />
           <p className="text-xs text-text-secondary -mt-2">
-            AiderDesk applies one global similarity threshold (Settings &gt; Memory), not a per-call one, so "min importance"
-            is the client-side floor: importance 4-5 rank first, importance 1 is never injected. If nothing qualifies,
-            nothing is added to the context.
+            AiderDesk applies one global similarity threshold (Settings &gt; Memory), not a per-call one, so "Min relevance"
+            is only a hint. Memories are injected in vector-search order (most relevant first) and filtered by the
+            "Min importance to inject" floor. If nothing qualifies, nothing is added to the context.
           </p>
 
           <Section title="Consolidation" />

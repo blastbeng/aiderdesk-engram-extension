@@ -45,8 +45,11 @@ export function getMemoryContextSafely(context: ExtensionContext): MemoryContext
 
 /**
  * Query project memories and (optionally) global memories, then merge,
- * de-duplicate by id, keep only entries this extension manages, and rank by
- * importance so importance 4-5 dominate the surviving slots.
+ * de-duplicate by id, and keep only entries this extension manages. Ranking is
+ * RELEVANCE-PRIMARY: the native vector-search order (nearest first) is kept, so
+ * what reaches the context is what the user is actually asking about. Importance
+ * is enforced as a floor (retrieval.min_importance), never as a sort - an
+ * importance-first sort evicted exactly the memories the query was about.
  */
 export async function retrieveScoped(
   memory: MemoryContext,
@@ -81,13 +84,9 @@ export async function retrieveScoped(
   }
 
   const all = Array.from(merged.values());
-  // Importance-first, then recency. Importance 4-5 therefore survive truncation.
-  all.sort((a, b) => {
-    const ia = importanceOf(a);
-    const ib = importanceOf(b);
-    if (ia !== ib) return ib - ia;
-    return (b.timestamp ?? 0) - (a.timestamp ?? 0);
-  });
+  // Keep the native relevance order (nearest first). No re-ranking: importance
+  // filtering happens afterwards in retrieval.ts via retrieval.min_importance,
+  // so truncation to `limit` keeps the most relevant hits, not the loudest ones.
 
   // Deterministic statement-level dedup after ranking: keep the highest-ranked
   // copy of a fact and drop exact (normalized) duplicates. A verbatim
@@ -171,4 +170,46 @@ export async function listAll(memory: MemoryContext): Promise<MemoryEntry[]> {
 
 export function linesForPrompt(entries: MemoryEntry[]): string[] {
   return entries.map((e) => memoryForPrompt(e.id, e.content));
+}
+
+export interface DedupReport {
+  /** Engram-managed entries examined. */
+  scanned: number;
+  /** Exact (normalized) duplicates removed. */
+  removed: number;
+}
+
+/**
+ * Deterministic exact-match dedup across every Engram-managed memory. Entries
+ * are grouped by (project scope, normalized statement); within a group the best
+ * copy (highest importance, then newest) is kept and the rest are deleted. No
+ * LLM is involved: idempotent, cheap, safe to run at any time, and it only ever
+ * touches rows this extension created (footer-decodable content).
+ */
+export async function deterministicDedup(memory: MemoryContext): Promise<DedupReport> {
+  const all = (await listAll(memory)).filter((entry) => entry?.id && isManaged(entry));
+  const groups = new Map<string, MemoryEntry[]>();
+  for (const entry of all) {
+    const statement = normalizeStatement(statementOf(entry));
+    if (!statement) continue;
+    const key = `${entry.projectId ?? ''}|${statement}`;
+    const group = groups.get(key);
+    if (group) group.push(entry);
+    else groups.set(key, [entry]);
+  }
+  let removed = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const best = [...group].sort((a, b) => {
+      const ia = importanceOf(a);
+      const ib = importanceOf(b);
+      if (ia !== ib) return ib - ia;
+      return (b.timestamp ?? 0) - (a.timestamp ?? 0);
+    })[0];
+    for (const entry of group) {
+      if (entry.id === best.id) continue;
+      if (await remove(memory, entry.id)) removed += 1;
+    }
+  }
+  return { scanned: all.length, removed };
 }

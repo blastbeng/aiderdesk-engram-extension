@@ -8,7 +8,7 @@
  *
  * Context-pollution guards:
  *  - hard cap on how many memories are injected (retrieval.max_memories)
- *  - importance floor, so importance-1 noise never reaches the context
+ *  - importance floor (retrieval.min_importance), so low-value noise never reaches the context
  *  - if nothing survives, return null and inject nothing at all
  */
 import type { ExtensionContext, MemoryEntry } from '@aiderdesk/extensions';
@@ -44,7 +44,8 @@ export async function retrieveForPrompt(
 
   if (!entries.length) return { block: null, count: 0 };
 
-  const kept = entries.filter((entry) => importanceOf(entry) >= Math.max(2, config.extraction.min_importance - 1));
+  const floor = Math.max(1, Math.round(config.retrieval.min_importance));
+  const kept = entries.filter((entry) => importanceOf(entry) >= floor);
   if (!kept.length) {
     logger.debug(`retrieval: ${entries.length} hit(s) below importance floor - injected nothing`);
     return { block: null, count: 0 };
