@@ -34,6 +34,7 @@ import type {
 } from '@aiderdesk/extensions';
 
 import { loadConfig, saveConfig, mergeConfig, resolveConfig, hasAgentOverride, type EngramConfig } from './src/config';
+import { listAgentProfiles, type AgentMeta } from './src/agents';
 import { logger } from './src/logger';
 import { loadState, saveState, projectStats, type EngramState } from './src/state';
 import { runExtraction } from './src/extraction';
@@ -71,7 +72,7 @@ function readConfigComponent(): string | undefined {
 export default class EngramMemoryExtension implements Extension {
   static metadata = {
     name: 'Engram Memory',
-    version: '1.0.0',
+    version: '1.1.0',
     description:
       'Automatic long-term memory: extracts durable facts from conversations with a secondary local OpenAI-compatible LLM, dedupes/updates/resolves conflicts in AiderDesk Memory, consolidates periodically, and injects only relevant memories.',
     author: 'local',
@@ -96,6 +97,12 @@ export default class EngramMemoryExtension implements Extension {
   private readonly inFlight = new Set<string>();
   /** Last user prompt per task, so retrieval has a query on the reminder hook. */
   private readonly lastPrompt = new Map<string, string>();
+  /**
+   * Agent profiles last seen through the authoritative API (project-scoped
+   * contexts). The settings dialog runs without a project, so this cache plus
+   * a disk scan (src/agents.ts) fill the gap there.
+   */
+  private agentMetaCache: AgentMeta[] = [];
 
   // ---------------------------------------------------------------- lifecycle
 
@@ -213,6 +220,7 @@ export default class EngramMemoryExtension implements Extension {
 
   async onAgentFinished(event: AgentFinishedEvent, context: ExtensionContext): Promise<void> {
     if (event.aborted) return;
+    this.cacheAgentProfiles(context);
     const agentId = await this.agentIdFor(context);
     const cfg = resolveConfig(this.config, agentId);
     if (!cfg.enabled || !cfg.extraction.enabled) return;
@@ -225,6 +233,7 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async onPromptFinished(event: PromptFinishedEvent, context: ExtensionContext): Promise<void> {
+    this.cacheAgentProfiles(context);
     // Resolve the per-agent config BEFORE checking the trigger: the global
     // trigger must not mask a per-agent prompt_end override (and vice versa).
     const agentId = await this.agentIdFor(context);
@@ -245,6 +254,7 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async onTaskClosed(event: TaskClosedEvent, context: ExtensionContext): Promise<void> {
+    this.cacheAgentProfiles(context);
     const agentId = event.task?.agentProfileId ?? (await this.agentIdFor(context));
     const cfg = resolveConfig(this.config, agentId);
     if (!cfg.enabled) return;
@@ -582,13 +592,14 @@ export default class EngramMemoryExtension implements Extension {
     return readConfigComponent();
   }
 
-  async getConfigData(context: ExtensionContext): Promise<unknown> {
-    const config = loadConfig(this.configPath);
-    // `_agents` is UI-only: the list of AiderDesk agent profiles available in
-    // this project, so the settings panel can render one tab per agent.
-    // mergeConfig() ignores unknown keys, so it never reaches config.json.
+  /**
+   * Refresh the agent-profile cache from the authoritative API. No-op outside
+   * a project context (getProjectContext throws there) - the previous cache
+   * stays and the settings dialog falls back to the disk scan.
+   */
+  private cacheAgentProfiles(context: ExtensionContext): void {
     try {
-      const profiles = (context.getProjectContext()?.getAgentProfiles() ?? [])
+      const profiles = (context.getProjectContext().getAgentProfiles() ?? [])
         .filter((profile) => profile?.id)
         .map((profile) => ({
           id: profile.id,
@@ -597,11 +608,51 @@ export default class EngramMemoryExtension implements Extension {
           model: profile.model,
           isSubagent: Boolean(profile.isSubagent),
         }));
-      return { ...config, _agents: profiles };
-    } catch (error) {
-      logger.debug(`agent profiles unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      return config;
+      if (profiles.length) this.agentMetaCache = profiles;
+    } catch {
+      /* outside a project scope - nothing to refresh */
     }
+  }
+
+  async getConfigData(context: ExtensionContext): Promise<unknown> {
+    const config = loadConfig(this.configPath);
+    // `_agents` is UI-only: the list of AiderDesk agent profiles, so the
+    // settings panel can render one tab per agent. mergeConfig() ignores
+    // unknown keys, so it never reaches config.json.
+    //
+    // The settings dialog runs in a GLOBAL context, where getProjectContext()
+    // throws. Fall back to the runtime cache, then to reading the agent
+    // profile files straight off disk (global + open projects).
+    let profiles: AgentMeta[] = [];
+    try {
+      profiles = (context.getProjectContext().getAgentProfiles() ?? [])
+        .filter((profile) => profile?.id)
+        .map((profile) => ({
+          id: profile.id,
+          name: profile.name,
+          provider: profile.provider,
+          model: profile.model,
+          isSubagent: Boolean(profile.isSubagent),
+        }));
+    } catch (error) {
+      logger.debug(`agent profiles unavailable via API: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (profiles.length) {
+      this.agentMetaCache = profiles;
+    } else {
+      let openProjectDirs: string[] = [];
+      try {
+        openProjectDirs = context.getOpenProjectDirs();
+      } catch {
+        /* store unavailable - global agents dir only */
+      }
+      // Disk scan first, runtime cache wins on duplicate ids (it reflects the
+      // live manager, including extension-provided profiles that have no file).
+      const merged = new Map(listAgentProfiles({ openProjectDirs }).map((p) => [p.id, p]));
+      for (const profile of this.agentMetaCache) merged.set(profile.id, profile);
+      profiles = Array.from(merged.values());
+    }
+    return profiles.length ? { ...config, _agents: profiles } : config;
   }
 
   async saveConfigData(configData: unknown, _context: ExtensionContext): Promise<unknown> {

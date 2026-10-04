@@ -16,6 +16,9 @@
  * check the per-agent configuration: global config for every agent, an agent
  * override for one agent only. Scenario 9 covers relevance-primary retrieval
  * with the retrieval.min_importance floor and the deterministic dedup command.
+ * Scenario 10 covers the settings dialog's global (project-less) context: the
+ * agent tab list falls back to the agent profile files on disk and `_agents`
+ * never reaches config.json.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -23,7 +26,7 @@
  * or:
  *   node tests/run.mjs
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -705,6 +708,84 @@ async function main(): Promise<void> {
       check(/green cluster with blue workers/.test(some.block ?? ''), 'the injected statement must not carry the footer');
     } finally {
       await h.close();
+    }
+  });
+
+  await scenario('10. Settings without a project: agent tabs come from the disk scan, and _agents never persists', async () => {
+    // The AiderDesk settings dialog runs the extension in a global context:
+    // getProjectContext() throws there, so getConfigData() must fall back to
+    // reading the agent profile files (global + open projects).
+    const home = mkdtempSync(join(tmpdir(), 'engram-agents-home-'));
+    const project = mkdtempSync(join(tmpdir(), 'engram-agents-proj-'));
+    const dir = mkdtempSync(join(tmpdir(), 'engram-agents-ext-'));
+    const configPath = join(dir, 'config.json');
+    const statePath = join(dir, 'state.json');
+    const previousHome = process.env.AIDER_DESK_HOME_DIR;
+    EngramMemoryExtension.testPaths = { configPath, statePath };
+    try {
+      // Global profiles: beta (ordered first by order.json, a subagent) and
+      // alpha. The project redefines alpha, so its metadata must win.
+      const mkProfile = (agentsDir: string, id: string, name: string, extra: Record<string, unknown> = {}) => {
+        const profileDir = join(agentsDir, name.toLowerCase().replace(/\s+/g, '-'));
+        mkdirSync(profileDir, { recursive: true });
+        writeFileSync(join(profileDir, 'config.json'), JSON.stringify({ id, name, provider: 'litellm', model: 'm', ...extra }));
+      };
+      const globalAgents = join(home, 'agents');
+      mkProfile(globalAgents, 'alpha', 'Alpha Global');
+      mkProfile(globalAgents, 'beta', 'Beta', { subagent: { enabled: true } });
+      writeFileSync(join(globalAgents, 'order.json'), JSON.stringify({ beta: 0, alpha: 1 }));
+      mkProfile(join(project, '.aider-desk', 'agents'), 'alpha', 'Alpha Project');
+      mkProfile(join(project, '.aider-desk', 'agents'), 'gamma', 'Gamma');
+
+      process.env.AIDER_DESK_HOME_DIR = home;
+
+      const ext = new EngramMemoryExtension();
+      // No agentProfiles option: the mock throws on getProjectContext(), exactly
+      // like the real API inside the settings dialog.
+      const ctx = mockExtensionContext(new MockMemoryContext(), project, {
+        sink: createLogSink(),
+        openProjectDirs: [project],
+      });
+
+      const data = (await ext.getConfigData(ctx)) as Record<string, unknown>;
+      const agents = Array.isArray(data._agents) ? (data._agents as { id: string; name?: string; isSubagent?: boolean }[]) : [];
+      check(agents.length === 3, `the disk scan must find 3 unique agent profiles, found ${agents.length}`);
+      check(
+        agents.map((a) => a.id).join(',') === 'beta,alpha,gamma',
+        `order.json must order beta first and open-project profiles must be included, got ${agents.map((a) => a.id).join(',')}`,
+      );
+      check(agents.find((a) => a.id === 'alpha')?.name === 'Alpha Project', 'the project-level alpha profile must win over the global one');
+      check(agents.find((a) => a.id === 'beta')?.isSubagent === true, 'subagent.enabled must surface as isSubagent');
+
+      // _agents is UI-only: saving the data the dialog sends back must not
+      // persist it.
+      const saved = (await ext.saveConfigData(data, ctx)) as Record<string, unknown>;
+      check(!('_agents' in saved), 'saveConfigData must drop the UI-only _agents key');
+      const onDisk = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      check(!('_agents' in onDisk), 'config.json must not contain the UI-only _agents key');
+
+      // Profiles seen once through the authoritative API (a project-scoped
+      // context, e.g. after an agent run) stay available to later settings
+      // dialogs, merged over the disk scan.
+      const apiCtx = mockExtensionContext(new MockMemoryContext(), project, {
+        sink: createLogSink(),
+        agentProfiles: [{ id: 'delta', name: 'Delta', provider: 'litellm', model: 'm' }],
+      });
+      const viaApi = (await ext.getConfigData(apiCtx)) as Record<string, unknown>;
+      check(
+        (Array.isArray(viaApi._agents) ? (viaApi._agents as { id: string }[]) : []).map((a) => a.id).join(',') === 'delta',
+        'the API path must be authoritative when a project context exists',
+      );
+      const merged = (await ext.getConfigData(ctx)) as Record<string, unknown>;
+      const mergedIds = (Array.isArray(merged._agents) ? (merged._agents as { id: string }[]) : []).map((a) => a.id);
+      check(mergedIds.includes('delta') && mergedIds.includes('beta'), `runtime-cached profiles must merge over the disk scan, got ${mergedIds.join(',')}`);
+    } finally {
+      if (previousHome === undefined) delete process.env.AIDER_DESK_HOME_DIR;
+      else process.env.AIDER_DESK_HOME_DIR = previousHome;
+      EngramMemoryExtension.testPaths = null;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(project, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

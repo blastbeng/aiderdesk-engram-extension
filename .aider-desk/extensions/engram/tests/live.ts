@@ -425,9 +425,13 @@ async function main(): Promise<void> {
   if (!Array.isArray(panel._agents) || panel._agents.map((a) => a.id).join(',') !== 'local,intesa') {
     throw new Error(`_agents missing from the settings payload: ${JSON.stringify(panel._agents)}`);
   }
-  // A context with no project context must degrade to the plain global config.
-  const plainPanel = (await ext.getConfigData(ctxB)) as EngramConfig & { _agents?: unknown };
-  if (plainPanel._agents !== undefined) throw new Error('_agents must be absent when no project context is available');
+  // No project context: the panel must still offer agent tabs via the fallback
+  // chain (runtime cache -> disk scan) instead of degrading to global-only.
+  const plainPanel = (await ext.getConfigData(ctxB)) as EngramConfig & { _agents?: { id: string }[] };
+  const plainIds = Array.isArray(plainPanel._agents) ? plainPanel._agents.map((a) => a.id) : [];
+  if (!plainIds.includes('local') || !plainIds.includes('intesa')) {
+    throw new Error(`_agents fallback without a project context lost the cached profiles: ${JSON.stringify(plainIds)}`);
+  }
 
   const savedAgents = (await ext.saveConfigData(
     { ...panel, agents: { intesa: { extraction: { min_importance: 4 }, secondary_llm: { model: LIVE_MODEL } } } },

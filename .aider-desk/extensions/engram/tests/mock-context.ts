@@ -55,6 +55,12 @@ export interface MockContextOptions {
    * context - which is the path index.ts's agent-list lookup must survive.
    */
   agentProfiles?: MockAgentProfile[];
+  /**
+   * What getOpenProjectDirs() answers (defaults to [projectDir]). Set to
+   * simulate which projects are open while the settings dialog asks for the
+   * agent list without a project context.
+   */
+  openProjectDirs?: string[];
 }
 
 export function mockExtensionContext(
@@ -70,7 +76,7 @@ export function mockExtensionContext(
       sink?.lines.push({ level: type, message });
     },
     getProjectDir: (): string => projectDir,
-    getOpenProjectDirs: (): string[] => [projectDir],
+    getOpenProjectDirs: (): string[] => options.openProjectDirs ?? [projectDir],
     getTaskContext: (): TaskContext | null => options.taskContext ?? null,
     getProjectContext: () => {
       if (!options.agentProfiles) throw new Error('ProjectContext is not available (mock)');

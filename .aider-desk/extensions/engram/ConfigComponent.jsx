@@ -163,6 +163,9 @@
         <p className="text-xs text-text-secondary">
           Global config: applies to every AiderDesk agent. Open an agent tab to give one agent its own secondary
           LLM, trigger, retrieval depth or consolidation interval.
+          {agentIds.length === 0
+            ? ' No agent tabs right now: none of your AiderDesk agent profiles (Settings > Agents, global or per project) could be listed.'
+            : ''}
         </p>
       )}
 

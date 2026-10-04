@@ -125,7 +125,8 @@ Everything below was verified against the `v0.81.0` git tag of `hotovo/aider-des
 | Settings panel | `getConfigComponent()` + `getConfigData()` / `saveConfigData()` | — |
 | Logging | `context.log(message, 'info' \| 'error' \| 'warn' \| 'debug')` | ~2125 |
 | Native secondary-model call (optional) | `TaskContext.generateText(modelId, systemPrompt, prompt): Promise<string \| undefined>` | ~1751 |
-| List the agents a project can run (per-agent settings tabs) | `ExtensionContext.getAgentProfiles(): Promise<AgentProfile[]>` | ~2100 |
+| List the agents a project can run (per-agent settings tabs) | `ProjectContext.getAgentProfiles(): AgentProfile[]` | ~2044 |
+| Settings dialog has no project context (global Settings > Extensions) | `getProjectContext()` throws there, so the agent tabs fall back to reading the profile files on disk: `~/.aider-desk/agents` + every open project's `.aider-desk/agents` | — |
 | Resolve which agent a task runs (per-agent config resolution) | `TaskContext.getTaskAgentProfile(): Promise<AgentProfile \| null>`, plus `event.agentProfile?.id` (`onImportantReminders`) and `task.agentProfileId` (`onTaskClosed`) | ~1490 |
 
 ### What the API does not offer (and the workarounds used)
@@ -253,7 +254,8 @@ Any OpenAI-compatible URL works: Ollama (`http://host:11434/v1`), LiteLLM, vLLM,
 Resolution is **global-first** (`resolveConfig()`): the global config is cloned, then the agent's validated overrides are applied section by section, field by field. An unknown or unresolvable agent id yields the global config unchanged, so a task whose agent profile cannot be determined never loses memory.
 
 - **Which agent is used** is resolved per event: `event.agentProfile.id` for prompt-time injection, `task.agentProfileId` at task close, `TaskContext.getTaskAgentProfile()` as the documented fallback for the remaining events.
-- **UI**: Settings → Extensions → Engram shows a **Global** tab plus one tab per agent profile listed in the project. A new agent tab starts in *Inherit global config*; switching it to *Custom* copies the current effective values so you change only what you want, and *Reset to inherit* deletes the override. `Memory: Show Statistics` reports which agent's config was applied.
+- **UI**: Settings → Extensions → Engram shows a **Global** tab plus one tab per agent profile. A new agent tab starts in *Inherit global config*; switching it to *Custom* copies the current effective values so you change only what you want, and *Reset to inherit* deletes the override. `Memory: Show Statistics` reports which agent's config was applied.
+- **How the tab list is discovered**: the settings dialog runs in a *global* context (no project), where `ProjectContext.getAgentProfiles()` is unavailable. The tabs are therefore listed from three sources, in order: the live API when a project context exists, profiles cached from earlier project-scoped calls in this session, and — always available — the agent profile files on disk (`~/.aider-desk/agents/*/config.json` plus every open project's `.aider-desk/agents/*/config.json`, ordered by `order.json`; project-level profiles win over global ones with the same id). Extension-provided in-memory profiles appear once they have been seen at runtime.
 - **Storage**: overrides live in `config.json` under `agents`. The agent list (`_agents`) is injected into the settings UI at read time and is never persisted.
 
 ## 5. Installation (10 steps)
@@ -318,6 +320,8 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | 6 | 20+ redundant memories → consolidation | safe_mode pass: merged without deletion; aggressive pass: redundancies deleted, all 4 distinct facts survive |
 | 7 | (bonus) native `aiderdesk` transport | Every call routed to `model_id` via `generateText`, 0 HTTP requests |
 | 8 | Per-agent config | Global config applies to every agent; an override wins for its agent only — different endpoint for one agent, memory off for another, untouched sections inherit |
+| 9 | Relevance-primary retrieval + deterministic dedup | Native vector order kept, below-floor memories never injected; exact duplicates removed (best copy per scope), idempotent |
+| 10 | Settings without a project context | Agent tabs fall back to the profile files on disk (`order.json` ordering, project-level wins), and the UI-only `_agents` key never reaches `config.json` |
 
 ## 8. Troubleshooting
 
@@ -341,7 +345,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 - **Injection via `onImportantReminders`**: the block arrives with the reminders (in the user message, inside `<ThisIsImportant>`), not in the system prompt — the 0.81.0 API offers no alternative.
 - **Consolidation in batches**: ~9,000-token budget per batch, oldest memories first; beyond that, remaining batches run on the next cycle.
 - **`prompt_end` as trigger**: fires often, so it costs more secondary-LLM calls; `agent_end` is recommended.
-- **Per-agent overrides need a resolvable agent id**: the id comes from the event payload or `TaskContext.getTaskAgentProfile()`. When neither is available (rare, e.g. a command invoked without a task context) the global config is used — memory degrades to global, never to nothing. The settings tabs list only the agent profiles AiderDesk reports for the current project.
+- **Per-agent overrides need a resolvable agent id**: the id comes from the event payload or `TaskContext.getTaskAgentProfile()`. When neither is available (rare, e.g. a command invoked without a task context) the global config is used — memory degrades to global, never to nothing. The settings tab list comes from the live API when available and from the agent profile files on disk otherwise (see "How the tab list is discovered" above) — including when the dialog is opened from the global Settings > Extensions page, which has no project context.
 
 ## 10. Privacy
 
