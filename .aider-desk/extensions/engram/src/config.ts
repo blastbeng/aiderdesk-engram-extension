@@ -91,15 +91,15 @@ export interface RetrievalConfig {
   enabled: boolean;
   max_memories: number;
   /**
-   * Desired minimum relevance (0..1). AiderDesk's native vector search applies a
-   * GLOBAL `memory.maxDistance` setting, not a per-call threshold, so this value is
-   * used as a best-effort client-side hint (see retrieval.ts). It never blocks retrieval.
-   */
-  min_relevance: number;
-  /**
    * Importance floor (1..5) for injection: memories below it are never added to
    * the context, regardless of vector similarity. Independent of the extraction
    * floor, so you can store liberally and inject selectively.
+   *
+   * (A previous `min_relevance` option was removed: AiderDesk's native vector
+   * search applies a GLOBAL `memory.maxDistance` setting, not a per-call
+   * threshold, and MemoryEntry carries no distance, so a lexical proxy could
+   * only ever guess. Relevance is enforced host-side; this section enforces
+   * the importance floor.)
    */
   min_importance: number;
   /** Include global-scope memories (projectId === '') alongside project memories. */
@@ -165,10 +165,16 @@ export const DEFAULT_CONFIG: EngramConfig = {
     api_key: 'local',
     model: 'synthetic/syn:small:text',
     temperature: 0.1,
-    max_tokens: 8192,
-    // 60 s: small reasoning models routinely spend 20-40 s before the first
-    // content token; a 30 s default produced chronic timeouts in production.
-    timeout_ms: 60000,
+    // 16384: reasoning models spend thousands of tokens in reasoning_content
+    // before emitting content; an 8192 cap made consolidation die with
+    // finish_reason=length. Servers clamp this to the model context, so
+    // asking large is safe.
+    max_tokens: 16384,
+    // 120 s: small reasoning models routinely spend 20-40 s before the first
+    // content token, and bursty LiteLLM queues stretch that further; 60 s
+    // still produced chronic timeouts in production. Consolidation overrides
+    // this upward per call (see consolidation.ts).
+    timeout_ms: 120000,
     headers: {},
   },
   extraction: {
@@ -183,7 +189,6 @@ export const DEFAULT_CONFIG: EngramConfig = {
   retrieval: {
     enabled: true,
     max_memories: 8,
-    min_relevance: 0.65,
     min_importance: 3,
     include_global: true,
   },
@@ -242,7 +247,6 @@ const SECTION_KEYS = {
   retrieval: {
     enabled: isBoolean,
     max_memories: isNumber,
-    min_relevance: isNumber,
     min_importance: isNumber,
     include_global: isBoolean,
   },

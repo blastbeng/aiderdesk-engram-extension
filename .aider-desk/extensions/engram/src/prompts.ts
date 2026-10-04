@@ -50,23 +50,25 @@ export const CLASSIFICATION_SYSTEM = `You are a memory deduplication clerk. You 
 
 You have NO tools. JSON only. No prose.
 
+Each existing memory is shown with a short handle like "#m3". When a verdict needs an existing memory, targetId is that handle, copied EXACTLY as shown (including the "m" prefix); do not renumber, abbreviate, or invent ids.
+
 For each candidate (by its index) return exactly one verdict:
 
 - NEW: the fact is not present in the existing memories. Create a new memory.
-- DUPLICATE: an existing memory already states the same fact. Do nothing. Set targetId to that memory.
-- UPDATE: an existing memory states the same subject but is now outdated/less precise. Set targetId to it and provide mergedContent: a single complete replacement sentence that incorporates the new information.
-- CONFLICT: an existing memory directly contradicts the new fact. Decide which one is current. Prefer the newer, more specific, explicitly-stated-by-the-user fact. Set targetId to the memory that must be rewritten and provide mergedContent. If the contradiction is time-dependent, mergedContent must state the time context explicitly (e.g. "As of 2026-10, ...; previously ...").
-- OBSOLETE: an existing memory is no longer true and the new fact supersedes it. Set targetId to it and provide mergedContent (the replacement), or omit mergedContent if the memory should simply be dropped.
+- DUPLICATE: an existing memory already states the same fact. Do nothing. Set targetId to that memory's handle.
+- UPDATE: an existing memory states the same subject but is now outdated/less precise. Set targetId to its handle and provide mergedContent: a single complete replacement sentence that incorporates the new information.
+- CONFLICT: an existing memory directly contradicts the new fact. Decide which one is current. Prefer the newer, more specific, explicitly-stated-by-the-user fact. Set targetId to the handle of the memory that must be rewritten and provide mergedContent. If the contradiction is time-dependent, mergedContent must state the time context explicitly (e.g. "As of 2026-10, ...; previously ...").
+- OBSOLETE: an existing memory is no longer true and the new fact supersedes it. Set targetId to its handle and provide mergedContent (the replacement), or omit mergedContent if the memory should simply be dropped.
 
 Rules:
 1. Judge by MEANING, not wording. "The project uses llama.cpp" and "Inference is handled by llama.cpp" are DUPLICATE.
 2. Never return DUPLICATE when the new fact adds real information - that is UPDATE.
 3. mergedContent must be a single self-contained sentence <= 220 chars, English, present tense, containing ALL the information worth keeping.
-4. targetId must be one of the provided existing memory ids, or null when the verdict is NEW.
+4. targetId must be one of the handles shown in the existing memories (e.g. "m3"), or null when the verdict is NEW.
 5. Every candidate index must appear exactly once in results.
 
 Output ONLY:
-{"results":[{"index":0,"verdict":"UPDATE","targetId":"id","mergedContent":"...","note":"short reason"}]}`;
+{"results":[{"index":0,"verdict":"UPDATE","targetId":"m3","mergedContent":"...","note":"short reason"}]}`;
 
 export const CONSOLIDATION_SYSTEM = `You are a memory librarian. You receive the full list of stored memories for one scope. Consolidate them into a smaller set of high-quality, non-redundant, non-contradictory memories.
 
@@ -74,13 +76,17 @@ You have NO tools. JSON only. No prose.
 
 Return an action for every group of memories you touch:
 
+Every memory is shown with a short handle like "#m1". In targetIds you refer to memories by that handle, copied EXACTLY as shown (including the "m" prefix); do not renumber, abbreviate, or invent handles.
+
+Actions:
+
 - KEEP: leave as is. Use for memories that are already good and unique.
 - MERGE: several memories say overlapping things. targetIds = all of them. content = one merged sentence (<= 220 chars) that keeps every distinct fact. importance = the highest importance in the group.
-- UPDATE: one memory is outdated, imprecise, or contains stale detail. targetIds = [that id]. content = the corrected sentence.
-- DELETE: a memory is obsolete, contradicted by a newer one that you KEEP/UPDATE, redundant with no added information, or contains a secret. targetIds = [that id]. No content.
+- UPDATE: one memory is outdated, imprecise, or contains stale detail. targetIds = [that handle]. content = the corrected sentence.
+- DELETE: a memory is obsolete, contradicted by a newer one that you KEEP/UPDATE, redundant with no added information, or contains a secret. targetIds = [that handle]. No content.
 
 Rules:
-1. Every input id must appear in exactly one action's targetIds.
+1. Every handle you mention must appear in exactly one action's targetIds. A handle you do not mention is kept as-is.
 2. Resolve contradictions: keep the current fact, DELETE the superseded one. If both are time-dependent, MERGE them into one memory that states the time context.
 3. Never merge facts about different subjects.
 4. Never invent information not present in the input.
@@ -89,7 +95,7 @@ Rules:
 7. importance 1 memories should be DELETEd unless they are the only record of something.
 
 Output ONLY:
-{"actions":[{"action":"MERGE","targetIds":["a","b"],"content":"...","importance":4,"reason":"same subject"}]}`;
+{"actions":[{"action":"MERGE","targetIds":["m1","m4"],"content":"...","importance":4,"reason":"same subject"}]}`;
 
 export const REPAIR_SYSTEM = `You repair JSON. You receive a broken JSON document produced by a model and a validation error. Return the corrected JSON document ONLY. Preserve every piece of information present in the input. Do not add information. Do not wrap in markdown fences. Do not add commentary. If the input contains no valid data at all, return exactly: {"memories":[]}`;
 

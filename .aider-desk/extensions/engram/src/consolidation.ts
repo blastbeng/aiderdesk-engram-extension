@@ -7,20 +7,20 @@
  */
 import type { ExtensionContext, MemoryEntry, TaskContext } from '@aiderdesk/extensions';
 import type { EngramConfig } from './config';
-import { chatWithTransport } from './llm';
+import { budget, chatWithTransport } from './llm';
 import { ConsolidationSchema, parseStructured, type ConsolidationAction } from './json';
 import { CONSOLIDATION_SYSTEM, buildConsolidationUser } from './prompts';
 import { estimateTokens } from './transcript';
 import {
   getMemoryContextSafely,
   isManaged,
-  linesForPrompt,
   listAll,
   metaForNew,
   remove,
   updateExisting,
 } from './store';
-import { decodeMemory } from './memory-format';
+import { decodeMemory, memoryForPromptAliased } from './memory-format';
+import { aliasFor, buildAliasTable, resolveAlias, type AliasTable } from './aliases';
 import { logger } from './logger';
 import { projectStats, saveState, type EngramState } from './state';
 
@@ -88,13 +88,24 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
   for (let i = 0; i < Math.min(batches.length, MAX_BATCHES); i++) {
     const batch = batches[i];
     const byId = new Map(batch.map((entry) => [entry.id, entry]));
+    // Short positional aliases (m1, m2, ...) instead of real UUIDs: models
+    // cannot reliably echo back long ids, which silently zeroed every
+    // production consolidation run. Resolution back to real ids is tolerant
+    // (see src/aliases.ts).
+    const table = buildAliasTable(batch);
     const scopeLabel = `${projectDir || '(no project)'} + global (batch ${i + 1}/${Math.min(batches.length, MAX_BATCHES)})`;
 
     const result = await chatWithTransport(config.secondary_llm, {
       system: CONSOLIDATION_SYSTEM,
-      user: buildConsolidationUser(linesForPrompt(batch), scopeLabel),
+      user: buildConsolidationUser(
+        batch.map((e) => memoryForPromptAliased(aliasFor(table, e.id), e.content)),
+        scopeLabel,
+      ),
       temperature: Math.min(config.secondary_llm.temperature, 0.2),
-      maxTokens: Math.max(2048, config.secondary_llm.max_tokens),
+      // A background job over many memories legitimately runs for minutes on
+      // a slow local GPU; the configured timeout is a floor, not a cap.
+      maxTokens: budget(config.secondary_llm, 'consolidation'),
+      timeoutMs: Math.max(config.secondary_llm.timeout_ms, 120_000),
       signal: options.signal,
     }, options.taskContext);
 
@@ -114,7 +125,7 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
       continue;
     }
 
-    await applyActions(parsed.data.actions, byId, memory, projectDir, report, config, state);
+    await applyActions(parsed.data.actions, table, byId, memory, projectDir, report, config, state);
   }
 
   const stats = projectStats(state, projectDir);
@@ -155,6 +166,7 @@ function chunkByTokens(entries: MemoryEntry[], budget: number): MemoryEntry[][] 
 
 async function applyActions(
   actions: ConsolidationAction[],
+  table: AliasTable,
   byId: Map<string, MemoryEntry>,
   memory: ReturnType<typeof getMemoryContextSafely>,
   projectDir: string,
@@ -166,7 +178,13 @@ async function applyActions(
   const touched = new Set<string>();
 
   for (const action of actions) {
-    const ids = action.targetIds.filter((id) => byId.has(id) && !touched.has(id));
+    // Resolve whatever the model wrote back to real ids; entries it referenced
+    // twice in one batch are applied only once.
+    const ids: string[] = [];
+    for (const raw of action.targetIds) {
+      const id = resolveAlias(raw, table);
+      if (id && byId.has(id) && !touched.has(id) && !ids.includes(id)) ids.push(id);
+    }
     if (!ids.length) {
       report.skipped += 1;
       continue;
@@ -229,6 +247,13 @@ async function applyActions(
         }
       }
     }
+  }
+
+  // Memories the model never mentioned were reviewed and survive. Counting
+  // only explicit KEEP actions reported `kept 0` for healthy production
+  // batches; every batch entry is accounted for exactly once here.
+  for (const id of byId.keys()) {
+    if (!touched.has(id)) report.kept += 1;
   }
 }
 

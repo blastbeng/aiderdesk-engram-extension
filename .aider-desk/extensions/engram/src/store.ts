@@ -172,6 +172,19 @@ export function linesForPrompt(entries: MemoryEntry[]): string[] {
   return entries.map((e) => memoryForPrompt(e.id, e.content));
 }
 
+/**
+ * Id-free statement list for the extraction prompt's do-not-restate corpus.
+ * Those memories are shown only so the model avoids restating them - they are
+ * never referenced by id - so short aliases would be noise there; plain
+ * statements keep the prompt small.
+ */
+export function statementsForPrompt(entries: MemoryEntry[]): string[] {
+  return entries
+    .map((e) => statementOf(e).replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 200);
+}
+
 export interface DedupReport {
   /** Engram-managed entries examined. */
   scanned: number;

@@ -26,7 +26,12 @@ export interface MockServer {
   close: () => Promise<void>;
 }
 
-export async function startMockLlm(responder: Responder): Promise<MockServer> {
+export async function startMockLlm(
+  responder: Responder,
+  /** `delayMs` holds every response open past the client's timeout, so the
+   *  harness can assert timeout classification (tests/run.ts scenario 12). */
+  opts: { delayMs?: number } = {},
+): Promise<MockServer> {
   const requests: ChatBody[] = [];
 
   const server: Server = createServer((req, res) => {
@@ -49,34 +54,39 @@ export async function startMockLlm(responder: Responder): Promise<MockServer> {
       }
       requests.push(body);
 
-      const out = responder(body);
-      if (typeof out === 'object') {
-        res.writeHead(out.status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: out.message } }));
-        return;
-      }
+      const respond = (): void => {
+        const out = responder(body);
+        if (typeof out === 'object') {
+          res.writeHead(out.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: out.message } }));
+          return;
+        }
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          id: 'chatcmpl-mock',
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model ?? 'mock',
-          choices: [
-            {
-              index: 0,
-              message: { role: 'assistant', content: out },
-              finish_reason: 'stop',
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            id: 'chatcmpl-mock',
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: body.model ?? 'mock',
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: out },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: {
+              prompt_tokens: Math.ceil((body.messages ?? []).reduce((n, m) => n + m.content.length, 0) / 4),
+              completion_tokens: Math.ceil(out.length / 4),
+              total_tokens: 0,
             },
-          ],
-          usage: {
-            prompt_tokens: Math.ceil((body.messages ?? []).reduce((n, m) => n + m.content.length, 0) / 4),
-            completion_tokens: Math.ceil(out.length / 4),
-            total_tokens: 0,
-          },
-        }),
-      );
+          }),
+        );
+      };
+
+      if (opts.delayMs && opts.delayMs > 0) setTimeout(respond, opts.delayMs);
+      else respond();
     });
   });
 
@@ -88,6 +98,9 @@ export async function startMockLlm(responder: Responder): Promise<MockServer> {
     requests,
     close: () =>
       new Promise<void>((resolve) => {
+        // Destroy keep-alive sockets and any in-flight (delayed) response so
+        // close() resolves promptly between scenarios.
+        (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
         server.close(() => resolve());
       }),
   };
@@ -154,7 +167,11 @@ function extract(user: string): string {
  *   fact: <content>
  *   category: decision | importance: 4 | scope: project
  *   existing memories:
- *   #mem-1 [imp=4 cat=decision scope=project]: <statement>
+ *   #m1 [imp=4 cat=decision scope=project]: <statement>
+ *
+ * Lines carry short positional aliases (`#m1`), not real UUIDs, so the parse
+ * is format-generic: any `#<token> [...]:` line is captured and its handle is
+ * echoed back in verdicts; extraction.ts resolves the handle via resolveAlias.
  */
 function classify(user: string): string {
   const results: Record<string, unknown>[] = [];
@@ -208,7 +225,7 @@ function judge(
 }
 
 function consolidate(user: string): string {
-  const lines = [...user.matchAll(/#(mem-\d+)\s*\[[^\]]*\]:\s*(.+)/g)].map((m) => ({
+  const lines = [...user.matchAll(/#(\S+)\s*\[[^\]]*\]:\s*(.+)/g)].map((m) => ({
     id: m[1],
     text: m[2].trim(),
   }));

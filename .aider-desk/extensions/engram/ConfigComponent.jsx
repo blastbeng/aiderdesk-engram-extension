@@ -247,9 +247,9 @@
             />
             <Input
               label="Max tokens"
-              value={String(llm.max_tokens ?? 8192)}
-              onChange={(e) => setLlm({ max_tokens: num(e.target.value, 8192) })}
-              placeholder="8192"
+              value={String(llm.max_tokens ?? 16384)}
+              onChange={(e) => setLlm({ max_tokens: num(e.target.value, 16384) })}
+              placeholder="16384"
             />
             <Input
               label="Timeout (ms)"
@@ -330,12 +330,6 @@
               value={String(retrieval.max_memories ?? 8)}
               onChange={(e) => setRetrieval({ max_memories: num(e.target.value, 8) })}
               placeholder="8"
-            />
-            <Input
-              label="Min relevance (hint)"
-              value={String(retrieval.min_relevance ?? 0.65)}
-              onChange={(e) => setRetrieval({ min_relevance: float(e.target.value, 0.65) })}
-              placeholder="0.65"
             />
             <Input
               label="Min importance to inject"

@@ -65,7 +65,9 @@ export const ConsolidationSchema = z.object({
     .array(
       z.object({
         action: z.enum(['KEEP', 'MERGE', 'UPDATE', 'DELETE']),
-        targetIds: z.array(z.string().trim()).min(1).max(40),
+        // z.coerce.string(): a model writing bare numeric handles
+        // ("targetIds":[3,7]) must validate, then be resolved tolerantly.
+        targetIds: z.array(z.coerce.string()).min(1).max(40),
         content: z.string().trim().max(1400).nullable().optional(),
         importance: z.coerce.number().int().min(1).max(5).nullable().optional(),
         category: z.enum(CATEGORIES as [MemoryCategory, ...MemoryCategory[]]).nullable().optional(),

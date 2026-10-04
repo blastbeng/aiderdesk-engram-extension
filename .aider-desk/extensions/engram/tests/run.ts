@@ -19,6 +19,12 @@
  * Scenario 10 covers the settings dialog's global (project-less) context: the
  * agent tab list falls back to the agent profile files on disk and `_agents`
  * never reaches config.json.
+ * Scenario 11 proves consolidation round-trips real UUID ids through the
+ * positional aliases (m1..mN) and counts unmentioned memories as kept.
+ * Scenario 12 proves a hanging endpoint is classified as timeout, not
+ * unreachable, and that it never blocks the agent. Scenario 13 covers
+ * resolveAlias tolerance for every id format a small model emits and the
+ * monotonic per-project stats counters.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -26,12 +32,14 @@
  * or:
  *   node tests/run.mjs
  */
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { AgentFinishedEvent, ContextMessage } from '@aiderdesk/extensions';
 
+import { aliasFor, buildAliasTable, resolveAlias } from '../src/aliases';
 import { hasAgentOverride, mergeConfig, resolveConfig, type EngramConfig } from '../src/config';
 import { logger } from '../src/logger';
 import { runExtraction, type ExtractionReport } from '../src/extraction';
@@ -39,7 +47,7 @@ import { runConsolidation } from '../src/consolidation';
 import { retrieveForPrompt } from '../src/retrieval';
 import { decodeMemory } from '../src/memory-format';
 import { deterministicDedup, importanceOf, metaForNew, statementOf } from '../src/store';
-import { loadState, type EngramState } from '../src/state';
+import { loadState, projectStats, type EngramState } from '../src/state';
 import { probe } from '../src/llm';
 
 import { startMockLlm, scriptedResponder, type MockServer, type Responder } from './mock-server';
@@ -786,6 +794,157 @@ async function main(): Promise<void> {
       rmSync(home, { recursive: true, force: true });
       rmSync(project, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ------------------------------------------------------------- scenario 11
+  await scenario('11. Consolidation round-trips real UUID ids through positional aliases; unmentioned memories count as kept', async () => {
+    const h = await makeHarness((body) => {
+      const user = body.messages?.find((m) => m.role === 'user')?.content ?? '';
+      // Parse the alias-prefixed prompt lines (#m1 [imp=... ...]: statement)
+      // exactly like a small model would. The store holds UUID ids the model
+      // never sees, so every action below only works if alias -> real-id
+      // resolution round-trips.
+      const lines = [...user.matchAll(/#(\S+)\s*\[[^\]]*\]:\s*(.+)/g)].map((m) => ({ id: m[1], text: m[2].trim() }));
+      const actions: Record<string, unknown>[] = [];
+      const cluster = lines.filter((l) => /pnpm/i.test(l.text));
+      if (cluster.length > 1) {
+        actions.push({
+          action: 'MERGE',
+          targetIds: cluster.map((l) => l.id),
+          content: 'The project uses pnpm as the package manager.',
+          importance: 4,
+          reason: 'duplicate cluster',
+        });
+      }
+      // The two distinct memories are deliberately NOT mentioned anywhere:
+      // the extension must count them as kept, not silently lose them.
+      return JSON.stringify({ actions });
+    });
+    try {
+      const uuids: string[] = Array.from({ length: 5 }, () => randomUUID());
+      const pnpmVariants = [
+        'The project uses pnpm as the package manager for every install.',
+        'This repository uses pnpm as the package manager for all installs and scripts.',
+        'The codebase uses pnpm as the package manager whenever dependencies are installed.',
+      ];
+      const distinct = [
+        'Deployment target is Kubernetes in the eu-west-1 region.',
+        'The release checklist requires a changelog entry before tagging.',
+      ];
+      for (let i = 0; i < 3; i++) {
+        h.memory.seed(uuids[i], h.projectDir, 'code-pattern', encodeForHarness(pnpmVariants[i], { category: 'configuration', importance: 3, scope: 'project', confidence: 0.8 }));
+      }
+      for (let i = 0; i < 2; i++) {
+        h.memory.seed(uuids[3 + i], h.projectDir, 'code-pattern', encodeForHarness(distinct[i], { category: 'configuration', importance: 4, scope: 'project', confidence: 0.9 }));
+      }
+      check(h.memory.count() === 5, `setup: expected 5 seeded memories, got ${h.memory.count()}`);
+
+      // Pass 1 - safe mode: the pnpm cluster merges into its primary; the
+      // unmentioned facts must be counted as kept, and nothing is deleted.
+      const safe = await runConsolidation({ context: h.context, projectDir: h.projectDir, config: h.config, state: h.state, statePath: h.statePath, taskContext: null });
+      check(!safe.failure, `safe consolidation reported a failure: ${safe.failure}`);
+      check(safe.scanned === 5, `expected to scan 5 memories, scanned ${safe.scanned}`);
+      check(safe.merged === 1, `expected the 3 pnpm variants to form 1 merge group, got merged=${safe.merged} (report: ${JSON.stringify(safe)})`);
+      check(safe.updated === 1, `expected the merge primary to be rewritten, got updated=${safe.updated}`);
+      check(safe.kept === 2, `the 2 unmentioned memories must count as kept, got kept=${safe.kept}`);
+      check(safe.deleted === 0, 'safe_mode must not delete anything');
+
+      const afterSafe = await h.memory.getAllMemories();
+      check(afterSafe.length === 5, `safe mode must keep all 5 entries, has ${afterSafe.length}`);
+      const primary = afterSafe.find((e) => e.id === uuids[0]);
+      check(!!primary && /uses pnpm as the package manager/.test(statementOf(primary)), 'the merge primary must carry the consolidated statement under its original UUID id');
+      const demoted = afterSafe.filter((e) => uuids.slice(1, 3).includes(e.id)).map((e) => importanceOf(e));
+      check(demoted.length === 2 && demoted.every((i) => i === 1), `safe mode must demote the merged-away copies to importance 1, got ${demoted.join(',')}`);
+
+      // Pass 2 - aggressive: the demoted copies are removed through their
+      // resolved UUID ids; the kept facts survive untouched.
+      const aggressiveConfig: EngramConfig = { ...h.config, consolidation: { ...h.config.consolidation, safe_mode: false } };
+      const aggressive = await runConsolidation({ context: h.context, projectDir: h.projectDir, config: aggressiveConfig, state: h.state, statePath: h.statePath, taskContext: null });
+      check(!aggressive.failure, `aggressive consolidation reported a failure: ${aggressive.failure}`);
+      check(aggressive.merged === 1 && aggressive.deleted === 2, `expected 1 merge + 2 deletions, got merged=${aggressive.merged} deleted=${aggressive.deleted} (report: ${JSON.stringify(aggressive)})`);
+      check(aggressive.kept === 2, `the unmentioned facts must be kept again, got kept=${aggressive.kept}`);
+
+      const after = await h.memory.getAllMemories();
+      check(after.length === 3, `store should hold 3 memories after the aggressive pass, has ${after.length}`);
+      for (const id of [uuids[0], uuids[3], uuids[4]]) {
+        check(after.some((e) => e.id === id), `survivor must keep its original id ${id}`);
+      }
+      check(after.some((e) => /Kubernetes in the eu-west-1/.test(statementOf(e))), 'the distinct facts must survive consolidation');
+    } finally {
+      await h.close();
+    }
+  });
+
+  // ------------------------------------------------------------- scenario 12
+  await scenario('12. A hanging endpoint is classified as timeout, not unreachable, and never blocks the agent', async () => {
+    // The mock holds every response for 5 s; the configured timeout is 1.1 s
+    // (the client floors timeouts at 1 s), so every call must abort.
+    const slow = await startMockLlm(scriptedResponder(), { delayMs: 5000 });
+    const h = await makeHarness(scriptedResponder());
+    try {
+      const cfg = mergeConfig({ secondary_llm: { base_url: slow.baseUrl, api_key: 'k', model: 'm', timeout_ms: 1100 } });
+
+      const t0 = Date.now();
+      const health = await probe(cfg.secondary_llm);
+      const probeMs = Date.now() - t0;
+      check(health.ok === false && health.kind === 'timeout', `probe must classify a hanging endpoint as timeout, got ${health.ok ? 'ok' : health.kind}`);
+      check(/timed out after/i.test(health.message), `the timeout message must say so, got: ${health.message}`);
+      check(probeMs < 4000, `the probe must fail at the configured timeout, took ${probeMs} ms`);
+
+      const report = await runExtraction({ context: h.context, messages: LLAMA_CONVERSATION(), projectDir: h.projectDir, taskId: 'task-12', config: cfg, state: h.state, statePath: h.statePath, taskContext: null });
+      check(h.memory.count() === 0, 'nothing may be written while the endpoint hangs');
+      check(!!report.failure, 'the failure must be reported, not swallowed');
+      check(/timed out|timeout/i.test(report.failure!) && !/unreachable/i.test(report.failure!), `the extraction failure must name the timeout, got: ${report.failure}`);
+      check(h.state.totals.llmFailures >= 1, 'timeouts must be counted in the statistics');
+    } finally {
+      await h.close();
+      await slow.close();
+    }
+  });
+
+  // ------------------------------------------------------------- scenario 13
+  await scenario('13. resolveAlias tolerates every id format a small model emits, and per-project stats increment monotonically', async () => {
+    // Part A - alias tolerance. Production models write m3, #m3, (m3), 3...
+    const ids = Array.from({ length: 4 }, () => randomUUID());
+    const table = buildAliasTable(ids.map((id) => ({ id })));
+    check(aliasFor(table, ids[0]) === 'm1' && aliasFor(table, ids[3]) === 'm4', 'aliasFor must seat entries in order');
+    check(resolveAlias('m3', table) === ids[2], 'plain handle');
+    check(resolveAlias('M3', table) === ids[2], 'case-insensitive handle');
+    check(resolveAlias('#m3', table) === ids[2], 'hash-prefixed handle');
+    check(resolveAlias('(m3)', table) === ids[2], 'parenthesised handle');
+    check(resolveAlias('m 3', table) === ids[2], 'spaced handle');
+    check(resolveAlias('m-3', table) === ids[2], 'dashed handle');
+    check(resolveAlias(3, table) === ids[2], 'numeric handle (JSON number targetIds)');
+    check(resolveAlias('3', table) === ids[2], 'bare digits mean prefix + index');
+    check(resolveAlias(ids[2].toUpperCase(), table) === ids[2], 'a full real id echoes back in any case');
+    check(resolveAlias('m0', table) === null && resolveAlias('m5', table) === null, 'out-of-range handles resolve to nothing');
+    check(resolveAlias('garbage', table) === null && resolveAlias(null, table) === null && resolveAlias(undefined, table) === null, 'junk resolves to null, never to a random id');
+
+    // Part B - per-project counters must INCREMENT across rounds, not be
+    // replaced by the latest run (the Object.assign regression).
+    const h = await makeHarness(scriptedResponder());
+    try {
+      await extract(h, LLAMA_CONVERSATION(), 'task-13a');
+      check(projectStats(h.state, h.projectDir).extractions === 1, `one run must count one extraction, got ${projectStats(h.state, h.projectDir).extractions}`);
+      check(h.state.totals.stored === 1, `one stored memory must be counted, got ${h.state.totals.stored}`);
+
+      await extract(
+        h,
+        [
+          userMsg('Quick reminder about our earlier decision: the inference backend of this project is llama.cpp, not Ollama.'),
+          assistantMsg('Right - llama-server stays the inference backend for this project.'),
+        ],
+        'task-13b',
+      );
+      check(projectStats(h.state, h.projectDir).extractions === 2, `a second run must increment the counter, got ${projectStats(h.state, h.projectDir).extractions}`);
+      check(h.state.totals.stored === 1, 'the duplicate round must not add to the stored counter');
+      check(h.state.totals.duplicatesSkipped === 1, 'the duplicate must be counted in the statistics');
+
+      const persisted = loadState(h.statePath);
+      check(projectStats(persisted, h.projectDir).extractions === 2, 'the counters must survive the state round-trip on disk');
+    } finally {
+      await h.close();
     }
   });
 

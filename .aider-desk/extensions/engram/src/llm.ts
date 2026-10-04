@@ -38,6 +38,12 @@ export interface LlmFailure {
   /** Short, log-safe message. Never contains request content. */
   message: string;
   status?: number;
+  /**
+   * `finish_reason` reported by the endpoint when it answered. `'length'`
+   * means the model was cut off mid-generation - the caller can retry with a
+   * larger budget (see withRetries).
+   */
+  finishReason?: string;
   durationMs: number;
 }
 
@@ -50,8 +56,36 @@ export interface ChatRequest {
   temperature?: number;
   /** Overrides the configured max_tokens for this call. */
   maxTokens?: number;
+  /**
+   * Overrides the configured timeout for this call. Used by consolidation,
+   * which is a background job over many memories and legitimately runs for
+   * minutes on a slow local GPU.
+   */
+  timeoutMs?: number;
   /** External cancellation (e.g. extension unload). */
   signal?: AbortSignal;
+}
+
+/**
+ * Per-call completion budgets, capped by `secondary_llm.max_tokens`.
+ *
+ * Reasoning-style local models (DeepSeek-R1 lineage: `syn/*`, `:reasoning`,
+ * Qwen3-thinking) spend most of the budget on hidden reasoning tokens before
+ * any `content` appears. Inheriting the configured `max_tokens` (32768 in
+ * practice) lets a classification call run for minutes on a 12 GB card; these
+ * caps keep each memory call bounded while leaving real room for reasoning.
+ */
+export const CALL_BUDGETS = {
+  extraction: 8192,
+  classification: 8192,
+  repair: 4096,
+  consolidation: 16384,
+  probe: 1024,
+} as const;
+
+/** A call budget clamped to the configured ceiling. */
+export function budget(cfg: SecondaryLlmConfig, kind: keyof typeof CALL_BUDGETS): number {
+  return Math.max(256, Math.min(CALL_BUDGETS[kind], Math.max(256, cfg.max_tokens)));
 }
 
 function joinUrl(base: string): string {
@@ -83,9 +117,21 @@ export async function chat(cfg: SecondaryLlmConfig, req: ChatRequest): Promise<L
 
   const url = joinUrl(cfg.base_url);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort('timeout'), Math.max(1000, cfg.timeout_ms));
+  const timeoutMs = Math.max(1000, req.timeoutMs ?? cfg.timeout_ms);
+  // Node 24 `fetch` rejects with the *abort reason* itself, not an
+  // AbortError, so the reason has to be tracked locally to classify the
+  // failure: a timeout must not be reported as 'unreachable' (19 such
+  // misclassified lines were logged in production before this fix).
+  let abortReason: 'timeout' | 'cancelled' | null = null;
+  const timeout = setTimeout(() => {
+    abortReason = 'timeout';
+    controller.abort('timeout');
+  }, timeoutMs);
 
-  const onExternalAbort = () => controller.abort('cancelled');
+  const onExternalAbort = () => {
+    abortReason = 'cancelled';
+    controller.abort('cancelled');
+  };
   if (req.signal) {
     if (req.signal.aborted) {
       clearTimeout(timeout);
@@ -139,15 +185,22 @@ export async function chat(cfg: SecondaryLlmConfig, req: ChatRequest): Promise<L
     }
 
     const text = extractCompletion(payload);
+    const finish = (payload as { choices?: { finish_reason?: unknown }[] }).choices?.[0]?.finish_reason;
+    const finishReason = typeof finish === 'string' && finish ? finish : undefined;
     if (text === null) {
       // Reasoning models often burn the whole budget in reasoning_content and
       // return content: null with finish_reason "length" - surface that.
-      const finish = (payload as { choices?: { finish_reason?: unknown }[] }).choices?.[0]?.finish_reason;
-      const hint = typeof finish === 'string' && finish ? ` (finish_reason=${finish} - reasoning models may need a larger max_tokens)` : '';
-      return { ok: false, kind: 'malformed', message: `response has no chat completion content${hint}`, durationMs: Date.now() - started };
+      const hint = finishReason ? ` (finish_reason=${finishReason} - reasoning models may need a larger max_tokens)` : '';
+      return {
+        ok: false,
+        kind: 'malformed',
+        message: `response has no chat completion content${hint}`,
+        finishReason,
+        durationMs: Date.now() - started,
+      };
     }
     if (!text.trim()) {
-      return { ok: false, kind: 'empty', message: 'empty completion', durationMs: Date.now() - started };
+      return { ok: false, kind: 'empty', message: 'empty completion', finishReason, durationMs: Date.now() - started };
     }
 
     const usage = (payload as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage;
@@ -159,11 +212,15 @@ export async function chat(cfg: SecondaryLlmConfig, req: ChatRequest): Promise<L
       durationMs: Date.now() - started,
     };
   } catch (err) {
-    if (isAbortError(err)) {
-      const reason = String((controller.signal as unknown as { reason?: unknown }).reason ?? '');
-      if (reason === 'timeout') {
-        return { ok: false, kind: 'timeout', message: `timed out after ${cfg.timeout_ms} ms`, durationMs: Date.now() - started };
-      }
+    // Classify by our own abort tracking first: Node >= 20 rejects fetch with
+    // the raw abort reason (e.g. the string 'timeout'), whose `name` is
+    // undefined, so `isAbortError` alone misses every real timeout. An abort
+    // racing a connect failure classifies as 'aborted', which is correct:
+    // cancellation must never be retried.
+    if (abortReason === 'timeout' || controller.signal.reason === 'timeout') {
+      return { ok: false, kind: 'timeout', message: `timed out after ${timeoutMs} ms`, durationMs: Date.now() - started };
+    }
+    if (abortReason === 'cancelled' || isAbortError(err) || controller.signal.aborted) {
       return { ok: false, kind: 'aborted', message: 'request cancelled', durationMs: Date.now() - started };
     }
     const msg = err instanceof Error ? err.message : String(err);
@@ -227,7 +284,7 @@ export async function probe(cfg: SecondaryLlmConfig): Promise<LlmResult> {
     // content: null with finish_reason "length". 1024 keeps the probe cheap
     // while leaving real room for the reasoning + a one-word answer (256 was
     // exhausted by reasoning alone against syn:small in live testing).
-    maxTokens: 1024,
+    maxTokens: budget(cfg, 'probe'),
     temperature: 0,
   });
 }
@@ -253,13 +310,43 @@ function isTransientFailure(result: LlmFailure): boolean {
   return false;
 }
 
-async function withRetries(req: ChatRequest, attempt: () => Promise<LlmResult>): Promise<LlmResult> {
-  let result = await attempt();
-  for (let n = 1; n < MAX_LLM_ATTEMPTS && !result.ok && isTransientFailure(result); n++) {
+/**
+ * The model was cut off mid-generation: a bigger budget may fix it.
+ */
+function isTruncation(result: LlmFailure): boolean {
+  return result.finishReason === 'length';
+}
+
+/**
+ * Retry transient transport failures; escalate the token budget when the
+ * endpoint reports `finish_reason: "length"` (reasoning models exhausting a
+ * small cap before emitting any content). Truncation and transient failures
+ * share the attempt budget; escalation is capped at the configured
+ * max_tokens, and an escalation that would not grow the budget ends the loop
+ * (the retry would truncate the same way).
+ */
+async function withRetries(
+  cfg: SecondaryLlmConfig,
+  req: ChatRequest,
+  attempt: (maxTokens: number | undefined) => Promise<LlmResult>,
+): Promise<LlmResult> {
+  let maxTokens = req.maxTokens;
+  let result = await attempt(maxTokens);
+  for (let n = 1; n < MAX_LLM_ATTEMPTS; n++) {
+    if (result.ok) break;
+    const transient = isTransientFailure(result);
+    const truncated = isTruncation(result);
+    if (!transient && !truncated) break;
+    if (truncated) {
+      const base = maxTokens ?? cfg.max_tokens;
+      const next = Math.min(cfg.max_tokens, base * 2);
+      if (next <= base) break;
+      maxTokens = next;
+    }
     if (req.signal?.aborted) break;
     await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * n));
     if (req.signal?.aborted) break;
-    result = await attempt();
+    result = await attempt(maxTokens);
   }
   return result;
 }
@@ -284,7 +371,7 @@ export async function chatWithTransport(
   // HTTP transport, or the degraded aiderdesk-without-task-context fallback
   // (a background extraction whose task was closed in the meantime).
   if (cfg.transport !== 'aiderdesk' || !taskContext || typeof taskContext.generateText !== 'function') {
-    return withRetries(req, () => chat(cfg, req));
+    return withRetries(cfg, req, (maxTokens) => chat(cfg, { ...req, maxTokens }));
   }
 
   const started = Date.now();
@@ -301,7 +388,8 @@ export async function chatWithTransport(
     return { ok: false, kind: 'aborted', message: 'request cancelled', durationMs: 0 };
   }
 
-  return withRetries(req, async (): Promise<LlmResult> => {
+  return withRetries(cfg, req, async (maxTokens): Promise<LlmResult> => {
+    if (maxTokens !== undefined) req = { ...req, maxTokens };
     try {
       const text = await taskContext.generateText(cfg.model_id, req.system, req.user);
       if (text === undefined || text === null) {

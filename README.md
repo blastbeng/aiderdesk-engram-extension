@@ -30,7 +30,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 .aider-desk/extensions/engram/   ← the extension itself (copy this folder)
 ├── index.ts                     Extension: events, commands, settings UI, queues
 ├── src/                         Pipeline modules (extraction, consolidation, …)
-├── tests/                       Offline acceptance harness (8 scenarios)
+├── tests/                       Offline acceptance harness (13 scenarios)
 ├── ConfigComponent.jsx          Settings panel
 ├── package.json / tsconfig.json
 └── README.md                    Pointer to this file
@@ -132,7 +132,7 @@ Everything below was verified against the `v0.81.0` git tag of `hotovo/aider-des
 ### What the API does not offer (and the workarounds used)
 
 1. **`MemoryEntry` has no metadata column** (`{ id, content, type, taskId?, projectId?, timestamp }`, ~line 950). → Attributes (category, importance, scope, confidence, timestamps) are encoded in a **footer** inside `content`: `[mem cat=… imp=… scope=… conf=… ts=… (ut=…)]`. The statement stays first (it dominates the embedding); the footer is stripped before injection and display. Memories whose footer does not decode are **never touched** by consolidation — native AiderDesk memories stay intact.
-2. **`retrieveMemories` filters on exact `projectId`** and applies a **global** distance cutoff (`memory.maxDistance`), not a per-call threshold, and returns **no score or distance**. → "Global" scope is implemented with `projectId === ''` (the native Memory default); `min_relevance` is advisory (no score comes back), and filtering is done client-side with `retrieval.min_importance`.
+2. **`retrieveMemories` filters on exact `projectId`** and applies a **global** distance cutoff (`memory.maxDistance`), not a per-call threshold, and returns **no score or distance**. → "Global" scope is implemented with `projectId === ''` (the native Memory default), and filtering is done client-side with `retrieval.min_importance` (the native API returns no score or distance).
 3. **No per-message system-prompt hook.** → Injection goes through `onImportantReminders`, the official event-return mechanism; the block is appended to the user message inside a tagged block.
 4. **`MemoryEntryType` is not exported** (string enum `'task' | 'user-preference' | 'code-pattern'`). → The native type is derived: `NativeMemoryType = Parameters<MemoryContext['storeMemory']>[2]`, mapped from Engram's 12 categories.
 5. **No "agent started" event usable for hot injection.** → The `onImportantReminders` callback covers it; when nothing relevant is retrieved, nothing is injected.
@@ -156,7 +156,7 @@ engram/
 │   ├── json.ts            zod v4 schemas + malformed-JSON recovery
 │   ├── state.ts           Statistics (state.json)
 │   └── logger.ts          Configurable [Memory] … logging
-├── tests/                 Offline harness (8 scenarios, real mock HTTP server)
+├── tests/                 Offline harness (13 scenarios, real mock HTTP server)
 └── ConfigComponent.jsx    Settings panel
 ```
 
@@ -176,7 +176,7 @@ ln -s /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules node_modules
 # 2) Typecheck (uses AiderDesk's bundled TypeScript; adjust the path to your install):
 /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 
-# 3) Run the offline test harness (8 scenarios, no real LLM needed):
+# 3) Run the offline test harness (13 scenarios, no real LLM needed):
 node tests/run.mjs
 #    equivalent: ./node_modules/.bin/jiti tests/run.ts
 ```
@@ -201,8 +201,8 @@ Notes:
     "api_key": "local",                          // llama-server accepts any string
     "model": "synthetic/syn:small:text",         // model name served by the endpoint
     "temperature": 0.1,
-    "max_tokens": 8192,
-    "timeout_ms": 30000
+    "max_tokens": 16384,       // reasoning models need headroom for reasoning_content
+    "timeout_ms": 120000          // 120 s default: small reasoning models think long
   },
   "extraction": {
     "enabled": true,
@@ -216,7 +216,6 @@ Notes:
   "retrieval": {
     "enabled": true,
     "max_memories": 8,
-    "min_relevance": 0.65,
     "min_importance": 3,           // injection floor: never inject below this importance
     "include_global": true
   },
@@ -334,14 +333,14 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | `generateText … returned no text` (aiderdesk transport) | `model_id` missing in Settings → Models | Create the provider/model or switch back to `transport: "http"` |
 | Extraction timeouts | Slow model on 12 GB | Lower `extraction.max_input_tokens` or raise `timeout_ms` |
 | Nothing is written at all | Candidate importance < `min_importance` | Lower `min_importance` to 2, check `debug` logs |
-| `response has no chat completion content (finish_reason=length)` | Reasoning model spending the whole budget on `reasoning_content` | Raise `secondary_llm.max_tokens` (≥ 4096; 8192 default is comfortable) |
+| `response has no chat completion content (finish_reason=length)` | Reasoning model spending the whole budget on `reasoning_content` | Raise `secondary_llm.max_tokens` (≥ 8192; 16384 default is comfortable) |
 | `Memory: Show Statistics` shows every LLM call failing after you edited `config.json` by hand | Config is read once at startup; the running process still uses the old endpoint | Restart AiderDesk (Settings-UI saves apply immediately — no restart needed) |
 | A per-agent override seems ignored | Agent id mismatch (override keyed by `AgentProfile.id`, not display name), or the agent tab is in *Inherit* mode | Open the agent's tab (its id is shown there), switch it to *Custom*, save; `Memory: Show Statistics` prints which agent's config was applied |
 
 ## 9. Known limitations (honesty section)
 
 - **Footer inside `content`**: a direct consequence of the missing metadata column in the 0.81.0 Memory API. Memories created outside Engram are neither read nor modified by consolidation.
-- **`min_relevance` is advisory**: the native API returns no score; the effective client-side gate is `retrieval.min_importance` plus AiderDesk's global `memory.maxDistance` setting.
+- **No per-call relevance threshold**: `retrieveMemories` returns no score or distance, so there is nothing to threshold against — the effective client-side gate is `retrieval.min_importance` plus AiderDesk's global `memory.maxDistance` setting.
 - **Injection via `onImportantReminders`**: the block arrives with the reminders (in the user message, inside `<ThisIsImportant>`), not in the system prompt — the 0.81.0 API offers no alternative.
 - **Consolidation in batches**: ~9,000-token budget per batch, oldest memories first; beyond that, remaining batches run on the next cycle.
 - **`prompt_end` as trigger**: fires often, so it costs more secondary-LLM calls; `agent_end` is recommended.

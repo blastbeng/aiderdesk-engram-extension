@@ -122,6 +122,22 @@ export class MockMemoryContext implements MemoryContext {
     return this.entries.size;
   }
 
+  /**
+   * Seed an entry with an explicit id. The harness uses UUID-shaped ids (the
+   * real store hands out UUIDs, not `mem-N`) to prove that positional-alias
+   * resolution round-trips real AiderDesk memory ids.
+   */
+  seed(id: string, projectId: string, type: string, content: string): void {
+    this.entries.set(id, {
+      id,
+      content,
+      type,
+      taskId: '',
+      projectId,
+      timestamp: Date.now() + this.entries.size,
+    });
+  }
+
   statements(): string[] {
     return Array.from(this.entries.values()).map((e) => e.content);
   }

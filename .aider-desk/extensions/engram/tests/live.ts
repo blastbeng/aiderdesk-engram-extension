@@ -96,7 +96,9 @@ function liveConfig(secondaryLlmOverrides: Record<string, unknown> = {}): Engram
       api_key: LIVE_KEY,
       model: LIVE_MODEL,
       temperature: 0.1,
-      max_tokens: 4096,
+      // Reasoning headroom: 4096 made consolidation die with
+      // finish_reason=length before any content was emitted.
+      max_tokens: 16384,
       timeout_ms: 90000,
       ...secondaryLlmOverrides,
     },

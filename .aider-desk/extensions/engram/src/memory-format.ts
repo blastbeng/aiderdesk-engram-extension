@@ -187,12 +187,21 @@ export function stripFooter(content: string): string {
 
 /**
  * Compact line used when feeding existing memories to the secondary LLM.
+ *
+ * `handle` is whatever id the prompt shows for this entry - usually a short
+ * positional alias (see src/aliases.ts) because models cannot reliably echo
+ * back long UUIDs, but the raw id also works.
  */
-export function memoryForPrompt(id: string, content: string): string {
+export function memoryForPromptAliased(handle: string, content: string): string {
   const decoded = decodeMemory(content);
-  if (!decoded) return `#${id}: ${content.replace(/\s+/g, ' ').trim().slice(0, 300)}`;
+  if (!decoded) return `#${handle}: ${content.replace(/\s+/g, ' ').trim().slice(0, 300)}`;
   const { statement, meta } = decoded;
-  return `#${id} [imp=${meta.importance} cat=${meta.category} scope=${meta.scope}]: ${statement}`;
+  return `#${handle} [imp=${meta.importance} cat=${meta.category} scope=${meta.scope}]: ${statement}`;
+}
+
+/** Compact prompt line showing the entry's real id (legacy call sites). */
+export function memoryForPrompt(id: string, content: string): string {
+  return memoryForPromptAliased(id, content);
 }
 
 /**

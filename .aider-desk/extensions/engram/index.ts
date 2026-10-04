@@ -69,10 +69,39 @@ function readConfigComponent(): string | undefined {
   }
 }
 
+  /**
+ * Report to the user wherever possible: the task log when a task is open,
+ * the extension log otherwise. The raw
+ * `ctx.getTaskContext()?.addLogMessage(...)` chain is completely silent when
+ * a command runs with no task open (e.g. invoked from a UI surface without a
+ * task), which made command feedback disappear.
+ */
+function say(context: ExtensionContext, level: 'info' | 'warn' | 'warning' | 'error', message: string): void {
+  // The two sinks name the warning level differently ('warn' for
+  // ExtensionContext.log, 'warning' for addLogMessage) - accept both here.
+  const isWarning = level === 'warn' || level === 'warning';
+  try {
+    const taskContext = context.getTaskContext();
+    if (taskContext && typeof taskContext.addLogMessage === 'function') {
+      taskContext.addLogMessage(isWarning ? 'warning' : level, message);
+      return;
+    }
+  } catch {
+    /* fall through to the extension log */
+  }
+  try {
+    context.log(message, isWarning ? 'warn' : level);
+  } catch {
+    if (isWarning) logger.warn(message);
+    else if (level === 'error') logger.error(message);
+    else logger.info(message);
+  }
+}
+
 export default class EngramMemoryExtension implements Extension {
   static metadata = {
     name: 'Engram Memory',
-    version: '1.1.0',
+    version: '1.2.0',
     description:
       'Automatic long-term memory: extracts durable facts from conversations with a secondary local OpenAI-compatible LLM, dedupes/updates/resolves conflicts in AiderDesk Memory, consolidates periodically, and injects only relevant memories.',
     author: 'local',
@@ -389,7 +418,8 @@ export default class EngramMemoryExtension implements Extension {
     await Promise.allSettled(Array.from(this.queues.values()));
   }
 
-  // ---------------------------------------------------------------- commands
+// ---------------------------------------------------------------- commands
+
 
   getCommands(context: ExtensionContext): CommandDefinition[] {
     return [
@@ -399,17 +429,17 @@ export default class EngramMemoryExtension implements Extension {
         execute: async (_args, ctx) => {
           const taskContext = ctx.getTaskContext();
           if (!taskContext) {
-            ctx.log('[Memory] no task context - open a task first', 'warn');
+            say(ctx, 'warn', '[Memory] no task context - open a task first');
             return;
           }
           const agentId = await this.agentIdFor(ctx);
           const cfg = resolveConfig(this.config, agentId);
           if (!cfg.enabled || !cfg.extraction.enabled) {
-            taskContext.addLogMessage('info', '[Memory] extraction is disabled for this agent');
+            say(ctx, 'info', '[Memory] extraction is disabled for this agent');
             return;
           }
           const messages = await taskContext.getContextMessages();
-          taskContext.addLogMessage('info', `[Memory] extraction started (background, agent ${agentId ?? 'global'})`);
+          say(ctx, 'info', `[Memory] extraction started (background, agent ${agentId ?? 'global'})`);
           this.queueExtraction(ctx, messages, agentId);
         },
       },
@@ -422,11 +452,11 @@ export default class EngramMemoryExtension implements Extension {
           const agentId = await this.agentIdFor(ctx);
           const cfg = resolveConfig(this.config, agentId);
           if (!cfg.enabled || !cfg.consolidation.enabled) {
-            ctx.getTaskContext()?.addLogMessage('info', '[Memory] consolidation is disabled for this agent');
+            say(ctx, 'info', '[Memory] consolidation is disabled for this agent');
             return;
           }
           const force = args.includes('force');
-          ctx.getTaskContext()?.addLogMessage('info', `[Memory] consolidation started (background, agent ${agentId ?? 'global'})`);
+          say(ctx, 'info', `[Memory] consolidation started (background, agent ${agentId ?? 'global'})`);
           this.enqueue(projectDir, async () => {
             const report = await runConsolidation({
               context: ctx,
@@ -445,7 +475,7 @@ export default class EngramMemoryExtension implements Extension {
             const line = report.failure
               ? `consolidation failed: ${report.failure}`
               : `consolidated ${report.scanned} memories -> merged ${report.merged}, updated ${report.updated}, deleted ${report.deleted}, kept ${report.kept}`;
-            ctx.getTaskContext()?.addLogMessage('info', `[Memory] ${line}`);
+            say(ctx, 'info', `[Memory] ${line}`);
           });
         },
       },
@@ -455,7 +485,7 @@ export default class EngramMemoryExtension implements Extension {
         execute: async (_args, ctx) => {
           const memory = getMemoryContextSafely(ctx);
           if (!memory) {
-            ctx.getTaskContext()?.addLogMessage('warning', '[Memory] AiderDesk Memory is disabled/unavailable');
+            say(ctx, 'warning', '[Memory] AiderDesk Memory is disabled/unavailable');
             return;
           }
           const projectDir = ctx.getProjectDir();
@@ -463,9 +493,8 @@ export default class EngramMemoryExtension implements Extension {
             const report = await deterministicDedup(memory);
             this.state.totals.deleted += report.removed;
             saveState(this.statePath, this.state);
-            ctx
-              .getTaskContext()
-              ?.addLogMessage(
+            say(
+ctx,
                 'info',
                 `[Memory] dedup: scanned ${report.scanned} managed memories, removed ${report.removed} exact duplicate(s)`,
               );
@@ -479,7 +508,7 @@ export default class EngramMemoryExtension implements Extension {
           const projectDir = ctx.getProjectDir();
           const memory = getMemoryContextSafely(ctx);
           if (!memory) {
-            ctx.getTaskContext()?.addLogMessage('warning', '[Memory] AiderDesk Memory is disabled/unavailable');
+            say(ctx, 'warning', '[Memory] AiderDesk Memory is disabled/unavailable');
             return;
           }
           const all = await listAll(memory);
@@ -502,12 +531,11 @@ export default class EngramMemoryExtension implements Extension {
             `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${cfg.consolidation.interval_tasks} rounds, safe_mode=${cfg.consolidation.safe_mode}`,
             `[Memory] secondary LLM: ${cfg.secondary_llm.model} @ ${cfg.secondary_llm.base_url}`,
           ];
-          for (const line of lines) ctx.getTaskContext()?.addLogMessage('info', line);
+          for (const line of lines) say(ctx, 'info', line);
 
           const result = await probe(cfg.secondary_llm);
-          ctx
-            .getTaskContext()
-            ?.addLogMessage(
+          say(
+ctx,
               result.ok ? 'info' : 'warning',
               result.ok
                 ? `[Memory] secondary LLM reachable, replied in ${result.durationMs} ms`
@@ -522,12 +550,12 @@ export default class EngramMemoryExtension implements Extension {
         execute: async (args, ctx) => {
           const query = args.join(' ').trim();
           if (!query) {
-            ctx.getTaskContext()?.addLogMessage('warning', '[Memory] usage: /memory:forget <text>');
+            say(ctx, 'warning', '[Memory] usage: /memory:forget <text>');
             return;
           }
           const memory = getMemoryContextSafely(ctx);
           if (!memory) {
-            ctx.getTaskContext()?.addLogMessage('warning', '[Memory] AiderDesk Memory is disabled/unavailable');
+            say(ctx, 'warning', '[Memory] AiderDesk Memory is disabled/unavailable');
             return;
           }
           const cfg = resolveConfig(this.config, await this.agentIdFor(ctx));
@@ -539,13 +567,13 @@ export default class EngramMemoryExtension implements Extension {
             cfg.retrieval.include_global,
           );
           if (!candidates.length) {
-            ctx.getTaskContext()?.addLogMessage('info', '[Memory] no matching memory found');
+            say(ctx, 'info', '[Memory] no matching memory found');
             return;
           }
           const target = candidates[0];
           const decoded = decodeMemory(target.content);
           const ok = await remove(memory, target.id);
-          ctx.getTaskContext()?.addLogMessage(
+          say(ctx, 
             ok ? 'info' : 'warning',
             ok
               ? `[Memory] forgot: ${(decoded ? decoded.statement : target.content).slice(0, 160)}`
@@ -559,15 +587,13 @@ export default class EngramMemoryExtension implements Extension {
         arguments: [{ description: 'confirm', required: true, options: ['confirm'] }],
         execute: async (args, ctx) => {
           if (!args.includes('confirm')) {
-            ctx
-              .getTaskContext()
-              ?.addLogMessage('warning', '[Memory] refusing to clear without the explicit "confirm" argument');
+            say(ctx, 'warning', '[Memory] refusing to clear without the explicit "confirm" argument');
             return;
           }
           const projectDir = ctx.getProjectDir();
           const memory = getMemoryContextSafely(ctx);
           if (!memory) {
-            ctx.getTaskContext()?.addLogMessage('warning', '[Memory] AiderDesk Memory is disabled/unavailable');
+            say(ctx, 'warning', '[Memory] AiderDesk Memory is disabled/unavailable');
             return;
           }
           const all = await listAll(memory);
@@ -580,7 +606,7 @@ export default class EngramMemoryExtension implements Extension {
           }
           this.state.totals.deleted += deleted;
           saveState(this.statePath, this.state);
-          ctx.getTaskContext()?.addLogMessage('info', `[Memory] cleared ${deleted} project memories`);
+          say(ctx, 'info', `[Memory] cleared ${deleted} project memories`);
         },
       },
     ];

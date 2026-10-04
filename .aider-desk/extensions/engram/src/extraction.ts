@@ -12,7 +12,8 @@
  */
 import type { ExtensionContext, ContextMessage, MemoryContext, MemoryEntry, TaskContext } from '@aiderdesk/extensions';
 import type { EngramConfig, MemoryCategory, MemoryScope } from './config';
-import { chatWithTransport } from './llm';
+import { budget, chatWithTransport } from './llm';
+import { aliasFor, buildAliasTable, resolveAlias, type AliasTable } from './aliases';
 import {
   ClassificationSchema,
   ExtractionSchema,
@@ -30,17 +31,17 @@ import {
   buildRepairUser,
 } from './prompts';
 import { buildTranscript, estimateTokens, isExtensionInjected } from './transcript';
-import { normalizeStatement } from './memory-format';
+import { memoryForPromptAliased, normalizeStatement } from './memory-format';
 import { looksSecret, redactSecrets } from './privacy';
 import {
   getMemoryContextSafely,
   importanceOf,
-  linesForPrompt,
   metaForNew,
   remove,
   retrieveScoped,
   scopeOf,
   statementOf,
+  statementsForPrompt,
   storeNew,
   updateExisting,
 } from './store';
@@ -128,7 +129,10 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
     config.extraction.max_existing_for_dedup,
     true,
   );
-  const existingLines = linesForPrompt(existing);
+  // Id-free statements: this corpus exists only so the model avoids
+  // restating known facts; nothing ever references it by id, and short
+  // handles here would only be noise.
+  const existingLines = statementsForPrompt(existing);
   const existingTokens = estimateTokens(existingLines.join('\n'));
 
   // --- 2. Bounded, redacted transcript.
@@ -158,6 +162,9 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       projectDir: projectDir || '(no project)',
       minImportance: config.extraction.min_importance,
     }),
+    // Bounded per-call budget: inheriting the configured max_tokens (32768 in
+    // practice) let one extraction call run for minutes on a reasoning model.
+    maxTokens: budget(config.secondary_llm, 'extraction'),
     signal: options.signal,
   }, options.taskContext);
 
@@ -179,6 +186,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       system: REPAIR_SYSTEM,
       user: buildRepairUser(first.text, parsed.errors ?? 'invalid'),
       temperature: 0,
+      maxTokens: budget(config.secondary_llm, 'repair'),
       signal: options.signal,
     }, options.taskContext);
     state.totals.llmCalls += 1;
@@ -237,6 +245,9 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
   // --- 6. Dedup / update / conflict classification against nearest existing memories.
   const existingForCandidate: { index: number; lines: string[] }[] = [];
   const corpora: MemoryEntry[][] = [];
+  // One alias table per candidate corpus: verdict targetIds are resolved
+  // through the same table the prompt was built with.
+  const corpusTables: AliasTable[] = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const corpus = await retrieveScoped(
@@ -247,7 +258,15 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       true,
     );
     corpora.push(corpus);
-    existingForCandidate.push({ index: i, lines: linesForPrompt(corpus) });
+    // Short handles (m1, m2, ...) instead of raw UUIDs: the secondary model
+    // cannot echo UUIDs back reliably, which silently zeroed UPDATE/CONFLICT
+    // verdicts in production (~25 of 27 rounds produced no update).
+    const table = buildAliasTable(corpus);
+    corpusTables.push(table);
+    existingForCandidate.push({
+      index: i,
+      lines: corpus.map((e) => memoryForPromptAliased(aliasFor(table, e.id), e.content)),
+    });
   }
 
   const classified = await classify(config, candidates, existingForCandidate, options.signal, state, statePath, options.taskContext);
@@ -305,7 +324,13 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       continue;
     }
 
-    const target = verdict.targetId ? byId.get(verdict.targetId) : undefined;
+    // Resolve whatever handle the model wrote back to the real memory id;
+    // an unresolvable handle degrades to NEW via the writeNewChecked path.
+    const resolvedId =
+      verdict.targetId && corpusTables[i]
+        ? resolveAlias(verdict.targetId, corpusTables[i])
+        : null;
+    const target = resolvedId ? byId.get(resolvedId) : undefined;
 
     switch (verdict.verdict) {
       case 'DUPLICATE': {
@@ -363,6 +388,7 @@ async function classify(
     system: CLASSIFICATION_SYSTEM,
     user: buildClassificationUser({ candidates, existingForCandidate }),
     temperature: Math.min(config.secondary_llm.temperature, 0.2),
+    maxTokens: budget(config.secondary_llm, 'classification'),
     signal,
   }, taskContext);
 
@@ -414,6 +440,11 @@ async function writeNew(
   return id ? 1 : 0;
 }
 
+/**
+ * Merge a stats patch additively: numeric fields INCREMENT the counter.
+ * `Object.assign` SET the counter, so `state.json` showed `extractions: 1`
+ * forever no matter how many extraction rounds ran.
+ */
 function bumpStats(
   state: EngramState,
   statePath: string,
@@ -421,7 +452,11 @@ function bumpStats(
   patch: Partial<ReturnType<typeof projectStats>>,
 ): void {
   const stats = projectStats(state, projectDir);
-  Object.assign(stats, patch);
+  const record = stats as unknown as Record<string, unknown>;
+  for (const [key, value] of Object.entries(patch)) {
+    const current = record[key];
+    record[key] = typeof value === 'number' && typeof current === 'number' ? current + value : value;
+  }
   saveState(statePath, state);
 }
 
