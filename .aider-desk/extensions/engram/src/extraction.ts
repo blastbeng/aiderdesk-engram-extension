@@ -31,12 +31,13 @@ import {
   buildRepairUser,
 } from './prompts';
 import { buildTranscript, estimateTokens, isExtensionInjected } from './transcript';
-import { memoryForPromptAliased, normalizeStatement } from './memory-format';
+import { decodeMemory, memoryForPromptAliased, normalizeStatement } from './memory-format';
 import { looksSecret, redactSecrets } from './privacy';
 import {
   getMemoryContextSafely,
   importanceOf,
   metaForNew,
+  metaForUpdate,
   remove,
   retrieveScoped,
   scopeOf,
@@ -97,6 +98,38 @@ function lastUserQuery(messages: ContextMessage[]): string {
   return '';
 }
 
+/**
+ * Redact secrets in one message BEFORE it is compacted into the transcript.
+ * Redacting only the finished transcript leaves a real hole: the transcript
+ * truncates every message to a character budget, and a secret cut in half by
+ * that cut (`sk-abc…` with the tail dropped) matches no rule any more, so the
+ * fragment reaches the secondary LLM unredacted. Redacting the source text
+ * first closes it; the post-build pass stays as a second net.
+ *
+ * Only user/assistant text is ever sent to the model (tool messages are
+ * reduced to tool names by the transcript builder), so only those are touched.
+ */
+function redactMessage(message: ContextMessage, enabled: boolean): ContextMessage {
+  if (!enabled || message.role === 'tool') return message;
+  const content = message.content;
+  if (typeof content === 'string') {
+    const result = redactSecrets(content, true);
+    return result.hits ? ({ ...message, content: result.text } as ContextMessage) : message;
+  }
+  if (!Array.isArray(content)) return message;
+  let hits = 0;
+  const parts = content.map((part) => {
+    if (typeof part !== 'object' || part === null) return part;
+    const p = part as { type?: string; text?: string };
+    if (p.type !== 'text' || typeof p.text !== 'string') return part;
+    const result = redactSecrets(p.text, true);
+    if (!result.hits) return part;
+    hits += result.hits;
+    return { ...p, text: result.text };
+  });
+  return hits ? ({ ...message, content: parts } as ContextMessage) : message;
+}
+
 export async function runExtraction(options: ExtractionOptions): Promise<ExtractionReport> {
   const report: ExtractionReport = {
     candidates: 0,
@@ -115,7 +148,9 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
     return report;
   }
 
-  const messages = options.messages.filter((m) => !isExtensionInjected(m));
+  const messages = options.messages
+    .filter((m) => !isExtensionInjected(m))
+    .map((m) => redactMessage(m, config.privacy.redact_secrets));
   if (!messages.length) return report;
 
   // --- 1. Nearest existing memories, used both as a "do not restate" list
@@ -146,6 +181,8 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
   });
   if (!built.transcript.trim()) return report;
 
+  // Second net: the per-message pass above scrubbed the source text; this
+  // catches anything the transcript builder assembled out of it.
   const redaction = redactSecrets(built.transcript, config.privacy.redact_secrets);
   if (redaction.hits > 0) {
     logger.info(`redacted ${redaction.hits} secret(s): ${redaction.categories.join(', ')}`);
@@ -162,8 +199,8 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       projectDir: projectDir || '(no project)',
       minImportance: config.extraction.min_importance,
     }),
-    // Bounded per-call budget: inheriting the configured max_tokens (32768 in
-    // practice) let one extraction call run for minutes on a reasoning model.
+    // Bounded per-call budget: inheriting the configured max_tokens (16384 by
+    // default) lets one extraction call run for minutes on a reasoning model.
     maxTokens: budget(config.secondary_llm, 'extraction'),
     signal: options.signal,
   }, options.taskContext);
@@ -351,8 +388,15 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
           report.stored += await writeNewChecked(candidate, corpus);
           break;
         }
-        const statement = (verdict.mergedContent ?? '').trim() || candidate.content;
-        const meta = metaForNew({
+        let statement = (verdict.mergedContent ?? '').trim() || candidate.content;
+        // mergedContent is model output and was never secret-swept (only
+        // candidate.content was, above): a classifier that paraphrases a
+        // secret into the merged statement must not write it. Fall back to
+        // the candidate text, which already passed the sweep.
+        if (looksSecret(statement, config.privacy.redact_secrets)) statement = candidate.content;
+        // createdAt of the memory being rewritten is preserved (see
+        // metaForUpdate): an update must not reset the fact's age.
+        const meta = metaForUpdate(decodeMemory(target.content)?.meta, {
           category: candidate.category,
           importance: Math.max(candidate.importance, importanceOf(target)),
           scope: scopeOf(target),

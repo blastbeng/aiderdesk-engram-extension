@@ -15,11 +15,12 @@ import {
   getMemoryContextSafely,
   isManaged,
   listAll,
-  metaForNew,
+  metaForUpdate,
   remove,
   updateExisting,
 } from './store';
 import { decodeMemory, memoryForPromptAliased } from './memory-format';
+import { looksSecret } from './privacy';
 import { aliasFor, buildAliasTable, resolveAlias, type AliasTable } from './aliases';
 import { logger } from './logger';
 import { projectStats, saveState, type EngramState } from './state';
@@ -79,13 +80,26 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
   report.scanned = targets.length;
   if (targets.length < 2) {
     logger.info(`consolidation: ${targets.length} managed memory - nothing to do`);
+    // The counter must be reset here too. Without it a project with nothing
+    // to consolidate stays above the interval forever, so every single
+    // extraction round re-triggers a consolidation that can only answer
+    // "nothing to do" - a permanent no-op loop (and a stats line that always
+    // reads "N/N rounds").
+    const stats = projectStats(state, projectDir);
+    stats.tasksSinceConsolidation = 0;
+    stats.lastConsolidationAt = Date.now();
+    saveState(statePath, state);
     return report;
   }
 
   const batches = chunkByTokens(targets, CONSOLIDATION_TOKEN_BUDGET);
-  logger.info(`consolidating ${targets.length} memories in ${Math.min(batches.length, MAX_BATCHES)} batch(es)...`);
+  const windowSize = Math.min(batches.length, MAX_BATCHES);
+  // True when the store is too large for one run: batches beyond the cap are
+  // never sent to the LLM this round.
+  const truncated = batches.length > MAX_BATCHES;
+  logger.info(`consolidating ${targets.length} memories in ${windowSize} batch(es)...`);
 
-  for (let i = 0; i < Math.min(batches.length, MAX_BATCHES); i++) {
+  for (let i = 0; i < windowSize; i++) {
     const batch = batches[i];
     const byId = new Map(batch.map((entry) => [entry.id, entry]));
     // Short positional aliases (m1, m2, ...) instead of real UUIDs: models
@@ -93,7 +107,7 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
     // production consolidation run. Resolution back to real ids is tolerant
     // (see src/aliases.ts).
     const table = buildAliasTable(batch);
-    const scopeLabel = `${projectDir || '(no project)'} + global (batch ${i + 1}/${Math.min(batches.length, MAX_BATCHES)})`;
+    const scopeLabel = `${projectDir || '(no project)'} + global (batch ${i + 1}/${windowSize})`;
 
     const result = await chatWithTransport(config.secondary_llm, {
       system: CONSOLIDATION_SYSTEM,
@@ -129,8 +143,26 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
   }
 
   const stats = projectStats(state, projectDir);
-  stats.tasksSinceConsolidation = 0;
-  stats.lastConsolidationAt = Date.now();
+  if (truncated) {
+    // Do NOT reset the round counter on a truncated run: batches beyond the
+    // cap were never seen, and resetting here would schedule the next run
+    // past them forever - with oldest-first batching the newest memories
+    // would never consolidate. Leaving the counter above the interval
+    // re-triggers consolidation on the next trigger until the backlog clears
+    // (earlier batches shrink as their duplicates merge away).
+    logger.warn(
+      `consolidation: ${batches.length - windowSize} batch(es) beyond the ${MAX_BATCHES}-batch cap ` +
+        'were not processed this run; they are picked up on the next consolidation trigger',
+    );
+  } else {
+    stats.tasksSinceConsolidation = 0;
+    stats.lastConsolidationAt = Date.now();
+  }
+  // Project counters must reflect consolidation too: `memory:stats` reads
+  // these per-project numbers, and they used to show only extraction work, so
+  // a project that merged 20 memories and deleted 15 reported none of it.
+  stats.updated += report.updated;
+  stats.deleted += report.deleted;
   saveState(statePath, state);
 
   logger.info(
@@ -212,9 +244,16 @@ async function applyActions(
 
     // MERGE / UPDATE: rewrite the first target, drop the rest.
     const primary = byId.get(ids[0])!;
-    const statement = (action.content ?? '').trim() || statementOf(primary);
+    let statement = (action.content ?? '').trim() || statementOf(primary);
+    // action.content is model output and was never secret-swept: a model that
+    // echoes a credential into the merged statement must not write it. Fall
+    // back to the primary's already-stored statement, which passed the sweep
+    // when it was written.
+    if (looksSecret(statement, config.privacy.redact_secrets)) statement = statementOf(primary);
     const decoded = decodeMemory(primary.content);
-    const meta = metaForNew({
+    // metaForUpdate: a merge rewrites an existing memory, so the primary's
+    // original createdAt survives (metaForNew would stamp it as brand new).
+    const meta = metaForUpdate(decoded?.meta, {
       category: action.category ?? decoded?.meta.category ?? 'other',
       importance: action.importance ?? decoded?.meta.importance ?? 3,
       scope: action.scope ?? decoded?.meta.scope ?? (projectDir ? 'project' : 'global'),

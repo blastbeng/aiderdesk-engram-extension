@@ -20,6 +20,7 @@
  */
 import type { MemoryContext } from '@aiderdesk/extensions';
 import type { MemoryCategory, MemoryScope } from './config';
+import { CATEGORIES } from './json';
 
 /**
  * `MemoryEntryType` is declared in @aiderdesk/extensions' index.d.ts as a
@@ -132,22 +133,10 @@ function parseFooter(raw: string): MemoryMeta | null {
   const confidence = Number(kv.get('conf'));
   const createdAt = Number(kv.get('ts'));
 
-  const knownCategories: MemoryCategory[] = [
-    'project',
-    'preference',
-    'configuration',
-    'decision',
-    'constraint',
-    'problem',
-    'solution',
-    'todo',
-    'environment',
-    'convention',
-    'api',
-    'other',
-  ];
-
-  if (!knownCategories.includes(category)) return null;
+  // Single source of truth for the category vocabulary (src/json.ts): the
+  // schemas, the prompts and this decoder must agree, and a footer written by
+  // an older build with a category this list does not know is dropped.
+  if (!CATEGORIES.includes(category)) return null;
   if (!Number.isFinite(importance) || importance < 1 || importance > 5) return null;
   if (scope !== 'global' && scope !== 'project') return null;
   if (!Number.isFinite(createdAt) || createdAt <= 0) return null;

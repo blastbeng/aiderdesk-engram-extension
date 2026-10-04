@@ -179,13 +179,15 @@ export default class EngramMemoryExtension implements Extension {
 
     // Fire-and-forget connectivity probe so the log tells you immediately
     // whether the secondary endpoint is reachable. Never blocks startup.
-    void probe(this.config.secondary_llm).then((result) => {
-      if (result.ok) {
-        logger.info(`secondary LLM reachable (${result.durationMs} ms)`);
-      } else {
-        logger.warn(`secondary LLM not reachable: ${result.kind} - ${result.message}`);
-      }
-    });
+    void probe(this.config.secondary_llm)
+      .then((result) => {
+        if (result.ok) {
+          logger.info(`secondary LLM reachable (${result.durationMs} ms)`);
+        } else {
+          logger.warn(`secondary LLM not reachable: ${result.kind} - ${result.message}`);
+        }
+      })
+      .catch(() => undefined);
 
     context.addDisposable(() => () => {
       this.abortController.abort('extension unloaded');
@@ -284,6 +286,12 @@ export default class EngramMemoryExtension implements Extension {
 
   async onTaskClosed(event: TaskClosedEvent, context: ExtensionContext): Promise<void> {
     this.cacheAgentProfiles(context);
+    // The prompt map is keyed by task id; without this the entry of every
+    // task that ever ran stays for the life of the process (the reminder
+    // hook is keyed by the *current* task, so a stale entry is never read -
+    // it is pure unbounded growth on a long-lived desktop session).
+    const closedTaskId = event.task?.id ?? context.getTaskContext()?.data?.id;
+    if (closedTaskId) this.lastPrompt.delete(closedTaskId);
     const agentId = event.task?.agentProfileId ?? (await this.agentIdFor(context));
     const cfg = resolveConfig(this.config, agentId);
     if (!cfg.enabled) return;
@@ -446,7 +454,7 @@ export default class EngramMemoryExtension implements Extension {
       {
         name: 'memory:consolidate',
         description: 'Engram: consolidate project + global memories (dedupe, merge, resolve conflicts)',
-        arguments: [{ description: 'force - run even when fewer than 2 memories' }],
+        arguments: [{ description: 'force - disable safe mode (aggressive merge and delete)' }],
         execute: async (args, ctx) => {
           const projectDir = ctx.getProjectDir();
           const agentId = await this.agentIdFor(ctx);
@@ -492,6 +500,10 @@ export default class EngramMemoryExtension implements Extension {
           this.enqueue(projectDir, async () => {
             const report = await deterministicDedup(memory);
             this.state.totals.deleted += report.removed;
+            // Dedup scans every project; only the removals that happened in
+            // THIS project belong in its per-project counter (the report
+            // breaks them down by project id).
+            projectStats(this.state, projectDir).deleted += report.removedByProject[projectDir] ?? 0;
             saveState(this.statePath, this.state);
             say(
 ctx,
@@ -524,7 +536,7 @@ ctx,
             `[Memory] AiderDesk entries: ${all.length} (Engram-managed ${managed.length}, native ${native.length})`,
             `[Memory] this project: ${mine.length} | global: ${global.length}`,
             `[Memory] agent: ${agentId ?? 'none'} (${hasAgentOverride(this.config, agentId) ? 'per-agent overrides applied' : 'global config'})`,
-            `[Memory] project counters: extractions ${stats.extractions}, stored ${stats.stored}, updated ${stats.updated}, duplicates ${stats.duplicates}, obsolete ${stats.obsolete}`,
+            `[Memory] project counters: extractions ${stats.extractions}, stored ${stats.stored}, updated ${stats.updated}, deleted ${stats.deleted}, duplicates ${stats.duplicates}, obsolete ${stats.obsolete}`,
             `[Memory] totals: LLM calls ${this.state.totals.llmCalls} (failures ${this.state.totals.llmFailures}), stored ${this.state.totals.stored}, updated ${this.state.totals.updated}, deleted ${this.state.totals.deleted}`,
             `[Memory] extraction: enabled=${cfg.extraction.enabled} trigger=${cfg.extraction.trigger} min_importance=${cfg.extraction.min_importance}`,
             `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories} min_importance=${cfg.retrieval.min_importance}`,
@@ -605,6 +617,9 @@ ctx,
             if (await remove(memory, entry.id)) deleted += 1;
           }
           this.state.totals.deleted += deleted;
+          // Every removed entry belongs to this project (the filter above is
+          // exact), so book them all into the per-project counter too.
+          projectStats(this.state, projectDir).deleted += deleted;
           saveState(this.statePath, this.state);
           say(ctx, 'info', `[Memory] cleared ${deleted} project memories`);
         },
@@ -695,6 +710,14 @@ ctx,
         ? `per-agent overrides: ${overrides.length} (${overrides.join(', ')})`
         : 'per-agent overrides: none (global config applies to every agent)',
     );
-    return merged;
+    // mergeConfig() strips `_agents` (the UI-only agent-profile list injected
+    // by getConfigData()). If the settings framework re-renders from this
+    // return value, the agent tabs would vanish after the first save - pass
+    // the list back through when the caller sent one.
+    const agents =
+      typeof configData === 'object' && configData !== null && '_agents' in configData
+        ? (configData as { _agents: unknown })._agents
+        : undefined;
+    return agents !== undefined ? { ...merged, _agents: agents } : merged;
   }
 }

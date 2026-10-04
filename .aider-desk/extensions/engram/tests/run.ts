@@ -24,7 +24,12 @@
  * Scenario 12 proves a hanging endpoint is classified as timeout, not
  * unreachable, and that it never blocks the agent. Scenario 13 covers
  * resolveAlias tolerance for every id format a small model emits and the
- * monotonic per-project stats counters.
+ * monotonic per-project stats counters. Scenario 14 covers the council-review
+ * regressions: a batch-cap-truncated consolidation must keep the round counter
+ * (so the unseen batches are revisited), model-written secrets in
+ * mergedContent / action.content must never reach the store, deterministic
+ * dedup attributes removals per project, and saveConfigData re-attaches the
+ * UI-only _agents list in its return value.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -47,7 +52,7 @@ import { runConsolidation } from '../src/consolidation';
 import { retrieveForPrompt } from '../src/retrieval';
 import { decodeMemory } from '../src/memory-format';
 import { deterministicDedup, importanceOf, metaForNew, statementOf } from '../src/store';
-import { loadState, projectStats, type EngramState } from '../src/state';
+import { loadState, projectStats, saveState, type EngramState } from '../src/state';
 import { probe } from '../src/llm';
 
 import { startMockLlm, scriptedResponder, type MockServer, type Responder } from './mock-server';
@@ -90,6 +95,8 @@ interface Harness {
   state: EngramState;
   projectDir: string;
   statePath: string;
+  /** The log sink wired into the mock context, for assertions on log output. */
+  sink: ReturnType<typeof createLogSink>;
   close: () => Promise<void>;
 }
 
@@ -127,6 +134,7 @@ async function makeHarness(responder: Responder, overrides: Record<string, unkno
     state,
     projectDir,
     statePath,
+    sink,
     close: async () => {
       await server.close();
       rmSync(dir, { recursive: true, force: true });
@@ -593,7 +601,12 @@ async function main(): Promise<void> {
       )) as EngramConfig;
       check(saved.agents?.sub?.extraction?.min_importance === 5, 'saveConfigData did not persist the per-agent override');
       check(saved.agents?.strict?.extraction?.min_importance === 5, 'saveConfigData dropped an untouched per-agent override');
-      check((saved as unknown as Record<string, unknown>)._agents === undefined, '_agents must not reach the saved config');
+      // The return value passes _agents back through for the settings UI
+      // (mergeConfig strips it from what is persisted, checked next).
+      check(
+        Array.isArray((saved as unknown as Record<string, unknown>)._agents),
+        'saveConfigData must re-attach the UI-only _agents list in its return value',
+      );
       const persisted = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
       check(persisted._agents === undefined, '_agents leaked into config.json');
       check(
@@ -766,9 +779,14 @@ async function main(): Promise<void> {
       check(agents.find((a) => a.id === 'beta')?.isSubagent === true, 'subagent.enabled must surface as isSubagent');
 
       // _agents is UI-only: saving the data the dialog sends back must not
-      // persist it.
+      // persist it - but the RETURN value passes the list back through, so a
+      // settings framework that re-renders from the response keeps its agent
+      // tabs after the first save.
       const saved = (await ext.saveConfigData(data, ctx)) as Record<string, unknown>;
-      check(!('_agents' in saved), 'saveConfigData must drop the UI-only _agents key');
+      check(
+        Array.isArray(saved._agents) && (saved._agents as unknown[]).length === 3,
+        'saveConfigData must re-attach the UI-only _agents list in its return value',
+      );
       const onDisk = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
       check(!('_agents' in onDisk), 'config.json must not contain the UI-only _agents key');
 
@@ -957,6 +975,256 @@ async function main(): Promise<void> {
     console.log(`${passed} passed, 0 failed.`);
   }
 }
+
+  // ------------------------------------------------------------- scenario 14
+  await scenario(
+    '14. Council regressions: a truncated consolidation keeps the round counter, model-written secrets never land in the store, dedup reports per-project removals',
+    async () => {
+      const SECRET = 'sk-harness000000000000deadbeef';
+
+      // Part A - consolidation batch cap: a run that cannot see every memory
+      // (7 single-memory batches vs MAX_BATCHES = 6) must NOT reset the round
+      // counter. Resetting would schedule the next run past the unseen
+      // batches forever, and with oldest-first batching the NEWEST memories
+      // would never consolidate.
+      {
+        const big = 'The regression corpus sentence is deliberately long. '.repeat(680); // ~8500 tokens
+        const h = await makeHarness((body) => {
+          if (/consolidat/i.test(systemOf(body))) {
+            const ids = [...joined(body).matchAll(/#(\S+)\s*\[[^\]]*\]:/g)].map((m) => m[1]);
+            return JSON.stringify({ actions: ids.map((id) => ({ action: 'KEEP', targetIds: [id] })) });
+          }
+          return '{"memories":[]}';
+        });
+        try {
+          for (let i = 0; i < 7; i++) {
+            await h.memory.storeMemory(
+              h.projectDir,
+              `big-${i}`,
+              'code-pattern',
+              encodeForHarness(`${big} variant ${i}.`, {
+                category: 'convention',
+                importance: 3,
+                scope: 'project',
+                confidence: 0.9,
+              }),
+            );
+          }
+          projectStats(h.state, h.projectDir).tasksSinceConsolidation = 5;
+          saveState(h.statePath, h.state);
+
+          const truncated = await runConsolidation({
+            context: h.context,
+            projectDir: h.projectDir,
+            config: h.config,
+            state: h.state,
+            statePath: h.statePath,
+            taskContext: null,
+          });
+          check(!truncated.failure, `truncated run reported a failure: ${truncated.failure}`);
+          check(truncated.kept === 6, `exactly 6 of the 7 memories must be processed, got ${truncated.kept}`);
+          check(h.memory.count() === 7, 'nothing may be deleted by KEEP actions');
+          const statsAfter = projectStats(h.state, h.projectDir);
+          check(
+            statsAfter.tasksSinceConsolidation === 5,
+            `a truncated run must NOT reset the round counter, got ${statsAfter.tasksSinceConsolidation}`,
+          );
+          check(
+            statsAfter.lastConsolidationAt === undefined,
+            'a truncated run must not stamp lastConsolidationAt (the store was not fully processed)',
+          );
+          check(
+            h.sink.lines.some((l) => /beyond the 6-batch cap/.test(l.message)),
+            'a truncated run must log the batch-cap warning',
+          );
+
+          // Non-truncated path: once every memory fits, the counter resets.
+          // Delete the oldest five (the store lists them oldest-first).
+          for (let i = 0; i < 5; i++) {
+            const all = await h.memory.getAllMemories();
+            await h.memory.deleteMemory(all[0].id);
+          }
+          const full = await runConsolidation({
+            context: h.context,
+            projectDir: h.projectDir,
+            config: h.config,
+            state: h.state,
+            statePath: h.statePath,
+            taskContext: null,
+          });
+          check(!full.failure, `full run reported a failure: ${full.failure}`);
+          const statsFull = projectStats(h.state, h.projectDir);
+          check(statsFull.tasksSinceConsolidation === 0, 'a full run must reset the round counter');
+          check(typeof statsFull.lastConsolidationAt === 'number', 'a full run must stamp lastConsolidationAt');
+
+          // The < 2 targets early return resets the counter too (it can only
+          // ever answer "nothing to do"); otherwise it would loop forever.
+          projectStats(h.state, h.projectDir).tasksSinceConsolidation = 3;
+          saveState(h.statePath, h.state);
+          await h.memory.deleteMemory((await h.memory.getAllMemories())[0].id);
+          const idle = await runConsolidation({
+            context: h.context,
+            projectDir: h.projectDir,
+            config: h.config,
+            state: h.state,
+            statePath: h.statePath,
+            taskContext: null,
+          });
+          check(idle.scanned === 1, `the idle run must scan 1 memory, got ${idle.scanned}`);
+          check(
+            projectStats(h.state, h.projectDir).tasksSinceConsolidation === 0,
+            'the < 2 targets early return must reset the round counter',
+          );
+        } finally {
+          await h.close();
+        }
+      }
+
+      // Part B - a secret inside the classifier's mergedContent must never be
+      // written: the UPDATE falls back to the already-swept candidate text.
+      {
+        const candidate = 'The staging deploy uses a rotated API key for authentication.';
+        const h = await makeHarness((body) => {
+          const system = systemOf(body);
+          if (/classify|verdict|DUPLICATE/i.test(system)) {
+            const alias = /#(\S+)\s*\[[^\]]*\]/.exec(joined(body))?.[1] ?? 'm1';
+            return JSON.stringify({
+              results: [
+                {
+                  index: 0,
+                  verdict: 'UPDATE',
+                  targetId: alias,
+                  mergedContent: `The staging key is ${SECRET} and rotation is weekly.`,
+                },
+              ],
+            });
+          }
+          return JSON.stringify({
+            memories: [{ content: candidate, category: 'configuration', importance: 4, scope: 'project', confidence: 0.9 }],
+          });
+        });
+        try {
+          const seeded = await h.memory.storeMemory(
+            h.projectDir,
+            'target-0',
+            'code-pattern',
+            encodeForHarness(candidate, { category: 'configuration', importance: 4, scope: 'project', confidence: 0.9 }),
+          );
+          const report = await extract(
+            h,
+            [userMsg('Reminder: the staging deploy uses a rotated API key for authentication.'), assistantMsg('Noted the deploy key policy.')],
+            'task-14b',
+          );
+          check(report.updated === 1, `the UPDATE verdict must still write, got updated=${report.updated}`);
+          const row = await h.memory.getMemory(seeded);
+          check(row !== null, 'the updated memory must exist');
+          const statement = row ? statementOf(row) : '';
+          check(!statement.includes(SECRET), 'a secret in mergedContent leaked into the memory store');
+          check(
+            statement === candidate,
+            `the UPDATE must fall back to the swept candidate text, got "${statement}"`,
+          );
+        } finally {
+          await h.close();
+        }
+      }
+
+      // Part C - a secret inside the consolidator's action.content must never
+      // be written: the MERGE falls back to the primary's stored statement.
+      {
+        const statement = 'The backup job runs nightly on the primary database host.';
+        const h = await makeHarness((body) => {
+          if (/consolidat/i.test(systemOf(body))) {
+            const ids = [...joined(body).matchAll(/#(\S+)\s*\[[^\]]*\]:/g)].map((m) => m[1]);
+            return JSON.stringify({
+              actions: [
+                {
+                  action: 'MERGE',
+                  targetIds: ids.slice(0, 2),
+                  content: `Merged backup note: ${SECRET} rotate weekly`,
+                  importance: 4,
+                  reason: 'near-duplicate statements',
+                },
+              ],
+            });
+          }
+          return '{"memories":[]}';
+        });
+        try {
+          for (let i = 0; i < 2; i++) {
+            await h.memory.storeMemory(
+              h.projectDir,
+              `bak-${i}`,
+              'code-pattern',
+              encodeForHarness(`${statement} (copy ${i})`, {
+                category: 'configuration',
+                importance: 3,
+                scope: 'project',
+                confidence: 0.85,
+              }),
+            );
+          }
+          const report = await runConsolidation({
+            context: h.context,
+            projectDir: h.projectDir,
+            config: h.config,
+            state: h.state,
+            statePath: h.statePath,
+            taskContext: null,
+          });
+          check(!report.failure, `merge run reported a failure: ${report.failure}`);
+          check(report.updated === 1, `the MERGE verdict must still write, got updated=${report.updated}`);
+          const survivors = (await h.memory.getAllMemories()).map((e) => statementOf(e));
+          check(
+            survivors.every((s) => !s.includes(SECRET)),
+            'a secret in action.content leaked into the memory store',
+          );
+          check(
+            survivors.some((s) => s === `${statement} (copy 0)` || s === `${statement} (copy 1)`),
+            'the MERGE must fall back to the primary statement when the model content carries a secret',
+          );
+        } finally {
+          await h.close();
+        }
+      }
+
+      // Part D - deterministic dedup must report removals per project, so the
+      // command handler can book them into the right per-project counter
+      // (dedup scans every project in one pass).
+      {
+        const h = await makeHarness((body) => '{"memories":[]}');
+        const other = '/tmp/engram-other-project';
+        try {
+          for (const [dir, tag] of [
+            [h.projectDir, 'a'],
+            [other, 'b'],
+          ] as const) {
+            for (let i = 0; i < 2; i++) {
+              await h.memory.storeMemory(
+                dir,
+                `dup-${tag}-${i}`,
+                'code-pattern',
+                encodeForHarness(`The ${tag} pipeline caches its docker layers for an hour.`, {
+                  category: 'configuration',
+                  importance: 3,
+                  scope: 'project',
+                  confidence: 0.9,
+                }),
+              );
+            }
+          }
+          const report = await deterministicDedup(h.memory);
+          check(report.removed === 2, `dedup must remove 2 duplicates, removed ${report.removed}`);
+          check(
+            report.removedByProject[h.projectDir] === 1 && report.removedByProject[other] === 1,
+            `removals must be attributed per project, got ${JSON.stringify(report.removedByProject)}`,
+          );
+        } finally {
+          await h.close();
+        }
+      }
+    },
+  );
 
 /** Local wrapper so the harness does not import store.ts metaForNew types. */
 function encodeForHarness(

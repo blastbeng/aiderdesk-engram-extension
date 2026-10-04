@@ -71,9 +71,11 @@ export interface ChatRequest {
  *
  * Reasoning-style local models (DeepSeek-R1 lineage: `syn/*`, `:reasoning`,
  * Qwen3-thinking) spend most of the budget on hidden reasoning tokens before
- * any `content` appears. Inheriting the configured `max_tokens` (32768 in
- * practice) lets a classification call run for minutes on a 12 GB card; these
- * caps keep each memory call bounded while leaving real room for reasoning.
+ * any `content` appears. Inheriting the configured `max_tokens` (16384 by
+ * default) lets a classification call run for minutes on a 12 GB card; these
+ * caps keep each memory call bounded while leaving real room for reasoning,
+ * and `withRetries` escalates a cap back up to `max_tokens` when the endpoint
+ * reports `finish_reason: "length"`.
  */
 export const CALL_BUDGETS = {
   extraction: 8192,
@@ -246,7 +248,12 @@ function extractCompletion(payload: unknown): string | null {
   if (Array.isArray(choices) && choices.length > 0) {
     const first = choices[0] as Record<string, unknown>;
     const message = first.message as Record<string, unknown> | undefined;
-    if (typeof message?.content === 'string') return message.content;
+    // An empty string is a *shape* the server produced, not an answer:
+    // reasoning models return `content: ""` with finish_reason "length" while
+    // the real text sits in `text` or a sibling field. Returning the empty
+    // string here shadows every fallback below and reports a bare "empty
+    // completion" instead of falling through.
+    if (typeof message?.content === 'string' && message.content.trim()) return message.content;
     // Some servers return content parts arrays.
     if (Array.isArray(message?.content)) {
       const parts = (message!.content as unknown[]).filter(
@@ -256,14 +263,15 @@ function extractCompletion(payload: unknown): string | null {
           (part as { type?: string }).type === 'text' &&
           typeof (part as { text?: unknown }).text === 'string',
       );
-      if (parts.length) return parts.map((part) => part.text).join('\n');
+      const joined = parts.map((part) => part.text).join('\n');
+      if (joined.trim()) return joined;
     }
-    if (typeof first.text === 'string') return first.text;
+    if (typeof first.text === 'string' && first.text.trim()) return first.text;
   }
 
   const direct = p.message as Record<string, unknown> | undefined;
-  if (typeof direct?.content === 'string') return direct.content;
-  if (typeof p.content === 'string') return p.content;
+  if (typeof direct?.content === 'string' && direct.content.trim()) return direct.content;
+  if (typeof p.content === 'string' && p.content.trim()) return p.content;
 
   return null;
 }
@@ -274,6 +282,18 @@ function extractCompletion(payload: unknown): string | null {
  */
 export async function probe(cfg: SecondaryLlmConfig): Promise<LlmResult> {
   if (cfg.transport === 'aiderdesk') {
+    // generateText needs a task context, so the probe cannot run here - but
+    // an empty model_id is a deterministic config error that must not be
+    // reported as "reachable", or memory:stats keeps saying the secondary
+    // LLM is fine while every call fails with 'disabled'.
+    if (!cfg.model_id?.trim()) {
+      return {
+        ok: false,
+        kind: 'disabled',
+        message: 'transport is "aiderdesk" but secondary_llm.model_id is empty',
+        durationMs: 0,
+      };
+    }
     return { ok: true, text: 'OK (aiderdesk transport - probe skipped)', durationMs: 0 };
   }
   return chat(cfg, {

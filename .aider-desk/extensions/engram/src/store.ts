@@ -130,6 +130,24 @@ export function metaForNew(meta: Omit<MemoryMeta, 'createdAt' | 'updatedAt'>): M
   return { ...meta, createdAt: Date.now() };
 }
 
+/**
+ * Meta for a write that REWRITES an existing memory (UPDATE / CONFLICT /
+ * OBSOLETE / MERGE). `metaForNew` stamps createdAt with now, which silently
+ * erased the age of every memory the system updated - a memory consolidated
+ * ten times looked ten minutes old, and "oldest first" consolidation ordering
+ * degraded to the order updates happened to arrive in. The original creation
+ * time is provenance: carry it over, and fall back to now only when the
+ * previous footer is missing or unreadable.
+ */
+export function metaForUpdate(
+  previous: MemoryMeta | null | undefined,
+  meta: Omit<MemoryMeta, 'createdAt' | 'updatedAt'>,
+): MemoryMeta {
+  const createdAt =
+    typeof previous?.createdAt === 'number' && previous.createdAt > 0 ? previous.createdAt : Date.now();
+  return { ...meta, createdAt };
+}
+
 export async function storeNew(
   memory: MemoryContext,
   projectDir: string,
@@ -190,6 +208,12 @@ export interface DedupReport {
   scanned: number;
   /** Exact (normalized) duplicates removed. */
   removed: number;
+  /**
+   * Removed entries counted per project id ('' = global scope). Dedup scans
+   * every project at once, but callers keep per-project stats: without this
+   * breakdown a removal in another project would be booked to the caller's.
+   */
+  removedByProject: Record<string, number>;
 }
 
 /**
@@ -211,6 +235,7 @@ export async function deterministicDedup(memory: MemoryContext): Promise<DedupRe
     else groups.set(key, [entry]);
   }
   let removed = 0;
+  const removedByProject: Record<string, number> = {};
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     const best = [...group].sort((a, b) => {
@@ -221,8 +246,12 @@ export async function deterministicDedup(memory: MemoryContext): Promise<DedupRe
     })[0];
     for (const entry of group) {
       if (entry.id === best.id) continue;
-      if (await remove(memory, entry.id)) removed += 1;
+      if (await remove(memory, entry.id)) {
+        removed += 1;
+        const scope = entry.projectId ?? '';
+        removedByProject[scope] = (removedByProject[scope] ?? 0) + 1;
+      }
     }
   }
-  return { scanned: all.length, removed };
+  return { scanned: all.length, removed, removedByProject };
 }

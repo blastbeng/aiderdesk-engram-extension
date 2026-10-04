@@ -9,6 +9,7 @@ export interface ProjectStats {
   extractions: number;
   stored: number;
   updated: number;
+  deleted: number;
   duplicates: number;
   obsolete: number;
   lastExtractionAt?: number;
@@ -50,6 +51,7 @@ export function loadState(path: string): EngramState {
           extractions: Number(value.extractions) || 0,
           stored: Number(value.stored) || 0,
           updated: Number(value.updated) || 0,
+          deleted: Number(value.deleted) || 0,
           duplicates: Number(value.duplicates) || 0,
           obsolete: Number(value.obsolete) || 0,
           lastExtractionAt: Number(value.lastExtractionAt) || undefined,
@@ -90,6 +92,7 @@ export function projectStats(state: EngramState, projectDir: string): ProjectSta
       extractions: 0,
       stored: 0,
       updated: 0,
+      deleted: 0,
       duplicates: 0,
       obsolete: 0,
     };
