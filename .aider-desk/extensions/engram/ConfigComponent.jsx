@@ -253,8 +253,8 @@
             />
             <Input
               label="Timeout (ms)"
-              value={String(llm.timeout_ms ?? 30000)}
-              onChange={(e) => setLlm({ timeout_ms: num(e.target.value, 30000) })}
+              value={String(llm.timeout_ms ?? 120000)}
+              onChange={(e) => setLlm({ timeout_ms: num(e.target.value, 120000) })}
               placeholder="30000"
             />
           </div>

@@ -69,7 +69,7 @@ function readConfigComponent(): string | undefined {
   }
 }
 
-  /**
+/**
  * Report to the user wherever possible: the task log when a task is open,
  * the extension log otherwise. The raw
  * `ctx.getTaskContext()?.addLogMessage(...)` chain is completely silent when
@@ -426,8 +426,7 @@ export default class EngramMemoryExtension implements Extension {
     await Promise.allSettled(Array.from(this.queues.values()));
   }
 
-// ---------------------------------------------------------------- commands
-
+  // ---------------------------------------------------------------- commands
 
   getCommands(context: ExtensionContext): CommandDefinition[] {
     return [
@@ -446,7 +445,13 @@ export default class EngramMemoryExtension implements Extension {
             say(ctx, 'info', '[Memory] extraction is disabled for this agent');
             return;
           }
-          const messages = await taskContext.getContextMessages();
+          let messages: ContextMessage[];
+          try {
+            messages = await taskContext.getContextMessages();
+          } catch (error) {
+            say(ctx, 'warning', `[Memory] cannot read the conversation: ${error instanceof Error ? error.message : String(error)}`);
+            return;
+          }
           say(ctx, 'info', `[Memory] extraction started (background, agent ${agentId ?? 'global'})`);
           this.queueExtraction(ctx, messages, agentId);
         },
@@ -478,6 +483,10 @@ export default class EngramMemoryExtension implements Extension {
               },
               state: this.state,
               statePath: this.statePath,
+              // Forced consolidation runs up to 6 batches at 120 s each. Without
+              // the unload signal it kept `onUnload` awaiting a job that could
+              // not be cancelled, hanging the extension reload for minutes.
+              signal: this.abortController.signal,
               taskContext: ctx.getTaskContext(),
             });
             const line = report.failure
@@ -506,10 +515,10 @@ export default class EngramMemoryExtension implements Extension {
             projectStats(this.state, projectDir).deleted += report.removedByProject[projectDir] ?? 0;
             saveState(this.statePath, this.state);
             say(
-ctx,
-                'info',
-                `[Memory] dedup: scanned ${report.scanned} managed memories, removed ${report.removed} exact duplicate(s)`,
-              );
+              ctx,
+              'info',
+              `[Memory] dedup: scanned ${report.scanned} managed memories, removed ${report.removed} exact duplicate(s)`,
+            );
           });
         },
       },
@@ -547,12 +556,12 @@ ctx,
 
           const result = await probe(cfg.secondary_llm);
           say(
-ctx,
-              result.ok ? 'info' : 'warning',
-              result.ok
-                ? `[Memory] secondary LLM reachable, replied in ${result.durationMs} ms`
-                : `[Memory] secondary LLM ${result.kind}: ${result.message}`,
-            );
+            ctx,
+            result.ok ? 'info' : 'warning',
+            result.ok
+              ? `[Memory] secondary LLM reachable, replied in ${result.durationMs} ms`
+              : `[Memory] secondary LLM ${result.kind}: ${result.message}`,
+          );
         },
       },
       {
@@ -585,7 +594,8 @@ ctx,
           const target = candidates[0];
           const decoded = decodeMemory(target.content);
           const ok = await remove(memory, target.id);
-          say(ctx, 
+          say(
+            ctx,
             ok ? 'info' : 'warning',
             ok
               ? `[Memory] forgot: ${(decoded ? decoded.statement : target.content).slice(0, 160)}`

@@ -29,7 +29,12 @@
  * (so the unseen batches are revisited), model-written secrets in
  * mergedContent / action.content must never reach the store, deterministic
  * dedup attributes removals per project, and saveConfigData re-attaches the
- * UI-only _agents list in its return value.
+ * UI-only _agents list in its return value. Scenario 15 covers the command
+ * surface: every command definition satisfies the host's validator, a task
+ * context that cannot supply the conversation is reported instead of thrown,
+ * the destructive clear is guarded by "confirm" and scoped to the project,
+ * memory:forget reports usage and deletes the best match, and onUnload cancels
+ * a consolidation that is in flight against an endpoint that never answers.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -966,6 +971,223 @@ async function main(): Promise<void> {
     }
   });
 
+  // ------------------------------------------------------------- scenario 15
+  await scenario(
+    '15. Command surface: host-legal definitions, no throw on a broken task context, guarded destructive clear, unload cancels a running consolidation',
+    async () => {
+      const h = await makeHarness(scriptedResponder());
+      const dir = mkdtempSync(join(tmpdir(), 'engram-cmd-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+      // Endpoint that answers nothing for 30 s: the only thing that can end a
+      // consolidation run against it is the unload signal.
+      const slow = await startMockLlm(scriptedResponder(), { delayMs: 30_000 });
+
+      writeFileSync(configPath, JSON.stringify(h.config, null, 2), 'utf-8');
+      EngramMemoryExtension.testPaths = { configPath, statePath };
+
+      try {
+        const ext = new EngramMemoryExtension();
+        const taskCtx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-cmd',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await ext.onLoad(taskCtx);
+        const commands = ext.getCommands(taskCtx);
+
+        // ---- A. Every command must satisfy the host's validator. AiderDesk
+        // checks each command against /^[a-z][a-z0-9\-_:]*$/ plus a non-empty
+        // description and an execute function, and rejects the whole extension
+        // registration when one of them fails.
+        const expected = [
+          'memory:extract',
+          'memory:consolidate',
+          'memory:dedup',
+          'memory:stats',
+          'memory:forget',
+          'memory:clear-project',
+        ];
+        check(commands.length === expected.length, `expected ${expected.length} commands, got ${commands.length}`);
+        for (const name of expected) {
+          check(commands.some((c) => c.name === name), `command ${name} is missing`);
+        }
+        for (const c of commands) {
+          check(
+            /^[a-z][a-z0-9\-_:]*$/.test(c.name),
+            `command name "${c.name}" is rejected by the AiderDesk host validator`,
+          );
+          check(typeof c.description === 'string' && c.description.trim().length > 0, `${c.name} has no description`);
+          check(typeof c.execute === 'function', `${c.name} has no execute function`);
+          check(c.arguments === undefined || Array.isArray(c.arguments), `${c.name} has a non-array arguments list`);
+          for (const arg of c.arguments ?? []) {
+            check(
+              typeof arg.description === 'string' && arg.description.trim().length > 0,
+              `${c.name} has an argument without a description`,
+            );
+          }
+        }
+
+        // ---- B. A task context that cannot hand over the conversation must
+        // report it and return: the host wraps execute() in a try/catch and
+        // surfaces only a generic "Extension command execution failed".
+        const brokenTask = mockTaskContext({ id: 'task-broken', logMessages });
+        brokenTask.getContextMessages = async () => {
+          throw new Error('conversation unavailable');
+        };
+        const brokenCtx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          taskContext: brokenTask,
+        });
+        const callsBefore = h.server.requests.length;
+        await commands.find((c) => c.name === 'memory:extract')!.execute([], brokenCtx);
+        await ext.drainQueues();
+        check(
+          logMessages.some((l) => l.includes('cannot read the conversation')),
+          `a failed conversation read must be reported, got: ${logMessages.join(' | ')}`,
+        );
+        check(
+          h.server.requests.length === callsBefore,
+          'a failed conversation read must not contact the secondary LLM',
+        );
+
+        // No task context: `say()` falls back to the extension log, so this
+        // assertion reads the sink, not the task log.
+        const noTaskSink = createLogSink();
+        const noTaskCtx = mockExtensionContext(h.memory, h.projectDir, { sink: noTaskSink });
+        await commands.find((c) => c.name === 'memory:extract')!.execute([], noTaskCtx);
+        check(
+          noTaskSink.lines.some((l) => l.message.includes('no task context')),
+          `memory:extract without a task must say so, got: ${noTaskSink.lines.map((l) => l.message).join(' | ')}`,
+        );
+
+        // ---- C. The destructive command is guarded, scoped and non-destructive
+        // outside its scope.
+        const seedManaged = (statement: string, projectDir: string, scope: 'project' | 'global', importance = 3) =>
+          h.memory.storeMemory(
+            projectDir,
+            'task-seed',
+            'code-pattern',
+            encodeForHarness(statement, { category: 'configuration', importance, scope, confidence: 0.9 }),
+          );
+        await seedManaged('The staging cluster listens on port 8443.', h.projectDir, 'project');
+        await seedManaged('The API gateway requires mTLS client certificates.', h.projectDir, 'project');
+        await seedManaged('The user prefers running models locally.', '', 'global');
+        await h.memory.storeMemory(
+          h.projectDir,
+          'task-native',
+          'task',
+          'A native memory written by the main agent, not managed by Engram.',
+        );
+        check(h.memory.count() === 4, `expected 4 seeded entries, got ${h.memory.count()}`);
+
+        const clear = commands.find((c) => c.name === 'memory:clear-project')!;
+        await clear.execute([], taskCtx);
+        check(h.memory.count() === 4, 'memory:clear-project must refuse without the confirm argument');
+        check(
+          logMessages.some((l) => l.includes('refusing to clear')),
+          'memory:clear-project must explain the refusal',
+        );
+        await clear.execute(['confirm'], taskCtx);
+        const remaining = h.memory.statements();
+        check(
+          h.memory.count() === 2,
+          `memory:clear-project must remove only this project's Engram memories, left: ${remaining.join(' | ')}`,
+        );
+        check(
+          remaining.some((s) => s.includes('prefers running models locally')),
+          'memory:clear-project must not touch global memories',
+        );
+        check(
+          remaining.some((s) => s.includes('not managed by Engram')),
+          'memory:clear-project must not touch memories it does not manage',
+        );
+
+        // ---- D. Forget: usage without an argument, best match deleted with it.
+        const forget = commands.find((c) => c.name === 'memory:forget')!;
+        await forget.execute([], taskCtx);
+        check(
+          logMessages.some((l) => l.includes('usage: /memory:forget')),
+          `memory:forget without text must print usage, got: ${logMessages.join(' | ')}`,
+        );
+        await forget.execute(['prefers', 'running', 'models', 'locally'], taskCtx);
+        check(h.memory.count() === 1, `memory:forget must delete the best match, ${h.memory.count()} left`);
+        check(
+          logMessages.some((l) => l.includes('forgot:')),
+          'memory:forget must report what it deleted',
+        );
+
+        // ---- E. Statistics must report the store, the counters and the probe.
+        await commands.find((c) => c.name === 'memory:stats')!.execute([], taskCtx);
+        check(
+          logMessages.some((l) => l.includes('AiderDesk entries')),
+          'memory:stats must report the store',
+        );
+        check(
+          logMessages.some((l) => /secondary LLM (reachable|not reachable|http_error|unreachable|timeout|malformed|empty|aborted|disabled)/.test(l)),
+          `memory:stats must report the secondary LLM probe, got: ${logMessages.join(' | ')}`,
+        );
+
+        await ext.onUnload();
+        check(existsSync(statePath), 'onUnload did not persist the state file');
+
+        // ---- F. Unload must cancel a running consolidation. The forced
+        // consolidation path runs up to 6 batches at >=120 s each; without the
+        // unload signal `onUnload` awaits a request nothing can cancel, hanging
+        // the extension reload for minutes.
+        writeFileSync(
+          configPath,
+          JSON.stringify(
+            mergeConfig({
+              ...h.config,
+              secondary_llm: { ...h.config.secondary_llm, base_url: slow.baseUrl, timeout_ms: 60_000 },
+            }),
+            null,
+            2,
+          ),
+          'utf-8',
+        );
+        const slowExt = new EngramMemoryExtension();
+        const slowCtx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({ id: 'task-slow', agentProfile: { id: 'local' }, logMessages }),
+        });
+        await slowExt.onLoad(slowCtx);
+        await seedManaged('The build cache lives on the NAS share.', h.projectDir, 'project');
+        await seedManaged('Release tags are annotated git tags.', h.projectDir, 'project');
+
+        await slowExt
+          .getCommands(slowCtx)
+          .find((c) => c.name === 'memory:consolidate')!
+          .execute([], slowCtx);
+        check(
+          logMessages.some((l) => l.includes('consolidation started')),
+          `memory:consolidate must report the start, got: ${logMessages.join(' | ')}`,
+        );
+
+        const t0 = Date.now();
+        await slowExt.onUnload();
+        const unloadMs = Date.now() - t0;
+        check(unloadMs < 10_000, `onUnload must cancel the in-flight consolidation, took ${unloadMs} ms`);
+        check(existsSync(join(dir, 'state.json')), 'the cancelled run must still persist its state');
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
+        await slow.close();
+      }
+    },
+  );
+
+  await scenario14();
+
   // ----------------------------------------------------------------- summary
   console.log('');
   if (failed.length) {
@@ -976,6 +1198,11 @@ async function main(): Promise<void> {
   }
 }
 
+// Scenario 14 is a top-level function (hoisted, so main() above can call it)
+// rather than a top-level await: a top-level await runs before main() is
+// invoked at the bottom of the file, which printed its PASS line ahead of the
+// harness header and ahead of scenarios 1-13.
+async function scenario14(): Promise<void> {
   // ------------------------------------------------------------- scenario 14
   await scenario(
     '14. Council regressions: a truncated consolidation keeps the round counter, model-written secrets never land in the store, dedup reports per-project removals',
@@ -1225,11 +1452,12 @@ async function main(): Promise<void> {
       }
     },
   );
+}
 
 /** Local wrapper so the harness does not import store.ts metaForNew types. */
 function encodeForHarness(
   statement: string,
-  meta: { category: 'configuration' | 'convention'; importance: number; scope: 'project'; confidence: number },
+  meta: { category: 'configuration' | 'convention'; importance: number; scope: 'project' | 'global'; confidence: number },
 ): string {
   // Reuse the extension's own encoder through store.ts's metaForNew.
   const { encodeMemory } = require('../src/memory-format') as typeof import('../src/memory-format');
