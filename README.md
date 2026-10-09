@@ -16,7 +16,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 - **Periodic consolidation** — every N agent turns (default 20), redundant memories are merged; `safe_mode` never deletes.
 - **Importance scoring (1–5)** — importance 1 is discarded at extraction; `retrieval.min_importance` is the injection floor.
 - **Project vs global scope** — decisions about this project stay with the project; general preferences follow you everywhere.
-- **Relevant retrieval only** — ≤ 8 memories injected per prompt, ranked by vector relevance (most relevant first) and gated by an importance floor; otherwise nothing is injected (zero context pollution).
+- **Relevant retrieval only** — ≤ 8 memories injected per prompt, ranked by vector relevance (most relevant first), gated by an importance floor **and** a lexical word-overlap gate against the current prompt, each statement capped at 300 chars; otherwise nothing is injected (zero context pollution).
 - **Secret safety** — 17 redaction rules (API keys, AWS, JWT, Bearer, passwords, private keys, high-entropy blobs) applied **before** anything leaves the process.
 - **Never blocks the agent** — fire-and-forget serialized queues; if the secondary LLM is offline, AiderDesk keeps working normally.
 - **Full UI + commands** — settings panel, `Memory: Extract Now`, `Memory: Consolidate`, `Memory: Dedup`, `Memory: Show Statistics`, `Memory: Forget`, `Memory: Clear Project Memories`.
@@ -30,7 +30,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 .aider-desk/extensions/engram/   ← the extension itself (copy this folder)
 ├── index.ts                     Extension: events, commands, settings UI, queues
 ├── src/                         Pipeline modules (extraction, consolidation, …)
-├── tests/                       Offline acceptance harness (13 scenarios)
+├── tests/                       Offline acceptance harness (16 scenarios)
 ├── ConfigComponent.jsx          Settings panel
 ├── package.json / tsconfig.json
 └── README.md                    Pointer to this file
@@ -132,7 +132,7 @@ Everything below was verified against the `v0.81.0` git tag of `hotovo/aider-des
 ### What the API does not offer (and the workarounds used)
 
 1. **`MemoryEntry` has no metadata column** (`{ id, content, type, taskId?, projectId?, timestamp }`, ~line 950). → Attributes (category, importance, scope, confidence, timestamps) are encoded in a **footer** inside `content`: `[mem cat=… imp=… scope=… conf=… ts=… (ut=…)]`. The statement stays first (it dominates the embedding); the footer is stripped before injection and display. Memories whose footer does not decode are **never touched** by consolidation — native AiderDesk memories stay intact.
-2. **`retrieveMemories` filters on exact `projectId`** and applies a **global** distance cutoff (`memory.maxDistance`), not a per-call threshold, and returns **no score or distance**. → "Global" scope is implemented with `projectId === ''` (the native Memory default), and filtering is done client-side with `retrieval.min_importance` (the native API returns no score or distance).
+2. **`retrieveMemories` filters on exact `projectId`** and applies a **global** distance cutoff (`memory.maxDistance`), not a per-call threshold, and returns **no score or distance**. → "Global" scope is implemented with `projectId === ''` (the native Memory default), and filtering is done client-side with `retrieval.min_importance` plus the lexical word-overlap gate `retrieval.min_overlap` (the native API returns no score or distance).
 3. **No per-message system-prompt hook.** → Injection goes through `onImportantReminders`, the official event-return mechanism; the block is appended to the user message inside a tagged block.
 4. **`MemoryEntryType` is not exported** (string enum `'task' | 'user-preference' | 'code-pattern'`). → The native type is derived: `NativeMemoryType = Parameters<MemoryContext['storeMemory']>[2]`, mapped from Engram's 12 categories.
 5. **No "agent started" event usable for hot injection.** → The `onImportantReminders` callback covers it; when nothing relevant is retrieved, nothing is injected.
@@ -156,7 +156,7 @@ engram/
 │   ├── json.ts            zod v4 schemas + malformed-JSON recovery
 │   ├── state.ts           Statistics (state.json)
 │   └── logger.ts          Configurable [Memory] … logging
-├── tests/                 Offline harness (13 scenarios, real mock HTTP server)
+├── tests/                 Offline harness (16 scenarios, real mock HTTP server)
 └── ConfigComponent.jsx    Settings panel
 ```
 
@@ -176,7 +176,7 @@ ln -s /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules node_modules
 # 2) Typecheck (uses AiderDesk's bundled TypeScript; adjust the path to your install):
 /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 
-# 3) Run the offline test harness (15 scenarios, no real LLM needed):
+# 3) Run the offline test harness (16 scenarios, no real LLM needed):
 node tests/run.mjs
 #    equivalent: ./node_modules/.bin/jiti tests/run.ts
 ```
@@ -217,6 +217,7 @@ Notes:
     "enabled": true,
     "max_memories": 8,
     "min_importance": 3,           // injection floor: never inject below this importance
+    "min_overlap": 1,             // min distinct content words shared with the prompt (0 = gate off)
     "include_global": true
   },
   "consolidation": {
@@ -300,7 +301,7 @@ Settings has one **Global** tab and one tab per AiderDesk agent profile: edit Gl
 
 The secondary-LLM API key can also be supplied through the **`ENGRAM_API_KEY`** environment variable, which overrides the value stored in `config.json` — useful for keeping the secret out of the settings file. A per-agent override that sets its own `api_key` still wins.
 
-## 7. The 6 tests (offline harness included)
+## 7. The tests (offline harness included)
 
 The `tests/` folder contains an **offline** harness that runs the real pipeline (extraction, classification, consolidation, redaction, repair, transport) against a **real mock OpenAI-compatible HTTP server** and a simulated **MemoryContext** (same `projectId` filtering semantics as the native API).
 
@@ -319,8 +320,14 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | 6 | 20+ redundant memories → consolidation | safe_mode pass: merged without deletion; aggressive pass: redundancies deleted, all 4 distinct facts survive |
 | 7 | (bonus) native `aiderdesk` transport | Every call routed to `model_id` via `generateText`, 0 HTTP requests |
 | 8 | Per-agent config | Global config applies to every agent; an override wins for its agent only — different endpoint for one agent, memory off for another, untouched sections inherit |
-| 9 | Relevance-primary retrieval + deterministic dedup | Native vector order kept, below-floor memories never injected; exact duplicates removed (best copy per scope), idempotent |
+| 9 | Relevance-primary retrieval + deterministic dedup | Native vector order kept, below-floor memories never injected; an off-topic memory the native search still returns is dropped by the word-overlap gate (`min_overlap: 0` disables it); exact duplicates removed (best copy per scope), idempotent |
 | 10 | Settings without a project context | Agent tabs fall back to the profile files on disk (`order.json` ordering, project-level wins), and the UI-only `_agents` key never reaches `config.json` |
+| 11 | Alias round-trip in consolidation | Real UUID ids survive positional aliases (m1, m2, …) to merge/delete the right memories; unmentioned memories count as kept |
+| 12 | Hanging secondary endpoint | Classified as `timeout` (not unreachable), counted once, never blocks the agent |
+| 13 | Alias resolution robustness + stats | `resolveAlias` tolerates every id format a small model emits; per-project stats increment monotonically |
+| 14 | Council regression pack | A truncated consolidation keeps the round counter, model-written secrets never land in the store, dedup reports per-project removals |
+| 15 | Command surface | Host-legal command definitions, no throw on a broken task context, guarded destructive clear, unload cancels a running consolidation |
+| 16 | Batch-failure resilience + hash false positives | A failed consolidation batch is skipped (cycle continues, counter kept, failure reported per batch), and pure-hex hashes (SHA-1/SHA-256) are not treated as secrets |
 
 ## 8. Troubleshooting
 
@@ -328,7 +335,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 |---|---|---|
 | `[Memory] secondary LLM probe failed` | llama-server down / wrong URL | `curl http://<host>:4000/v1/models`; fix `base_url` in Settings |
 | No extraction in logs | Trigger not reached or extraction disabled | Check `extraction.enabled`, `trigger`, set log level `debug` |
-| Memories never injected | Native Memory disabled, nothing relevant, or the importance floor | Check Settings → Memory; `Memory: Extract Now`; raise `retrieval.max_memories` or lower `retrieval.min_importance` |
+| Memories never injected | Native Memory disabled, nothing relevant, the importance floor — or every hit failed the word-overlap gate | Check Settings → Memory; `Memory: Extract Now`; raise `retrieval.max_memories`, lower `retrieval.min_importance`, or set `retrieval.min_overlap` to 0 to disable the gate |
 | Duplicates persist | Secondary LLM too weak to classify | Raise `max_existing_for_dedup`; run `Memory: Consolidate` |
 | `generateText … returned no text` (aiderdesk transport) | `model_id` missing in Settings → Models | Create the provider/model or switch back to `transport: "http"` |
 | Extraction timeouts | Slow model on 12 GB | Lower `extraction.max_input_tokens` or raise `timeout_ms` |
@@ -340,9 +347,9 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 ## 9. Known limitations (honesty section)
 
 - **Footer inside `content`**: a direct consequence of the missing metadata column in the 0.81.0 Memory API. Memories created outside Engram are neither read nor modified by consolidation.
-- **No per-call relevance threshold**: `retrieveMemories` returns no score or distance, so there is nothing to threshold against — the effective client-side gate is `retrieval.min_importance` plus AiderDesk's global `memory.maxDistance` setting.
+- **No per-call relevance threshold**: `retrieveMemories` returns no score or distance, and AiderDesk's global `memory.maxDistance` (default 1.5 on the 0–2 cosine scale) is permissive — the effective client-side gates are `retrieval.min_importance` and the lexical word-overlap gate `retrieval.min_overlap`.
 - **Injection via `onImportantReminders`**: the block arrives with the reminders (in the user message, inside `<ThisIsImportant>`), not in the system prompt — the 0.81.0 API offers no alternative.
-- **Consolidation in batches**: ~9,000-token budget per batch, oldest memories first; beyond that, remaining batches run on the next cycle.
+- **Consolidation in batches**: ~4,500-token budget per batch, oldest memories first; a failed batch is skipped and reported while the cycle continues with the next; beyond budget, remaining batches run on the next cycle.
 - **`prompt_end` as trigger**: fires often, so it costs more secondary-LLM calls; `agent_end` is recommended.
 - **Per-agent overrides need a resolvable agent id**: the id comes from the event payload or `TaskContext.getTaskAgentProfile()`. When neither is available (rare, e.g. a command invoked without a task context) the global config is used — memory degrades to global, never to nothing. The settings tab list comes from the live API when available and from the agent profile files on disk otherwise (see "How the tab list is discovered" above) — including when the dialog is opened from the global Settings > Extensions page, which has no project context.
 

@@ -45,8 +45,12 @@ const RULES: Rule[] = [
   { name: 'private-key', re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g },
   // JWTs (three base64url segments)
   { name: 'jwt', re: /\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\b/g },
-  // Long high-entropy hex/base64 blobs that look like tokens (>=40 chars)
-  { name: 'entropy-blob', re: /\b[A-Za-z0-9+/]{40,}={0,2}\b/g },
+  // Long high-entropy base64-ish blobs that look like tokens (>=40 chars).
+  // NOT pure hex: a 40-64 char hex string is a git/object hash (SHA-1/SHA-256)
+  // or a digest, which is not a secret. Hashes appear in coding transcripts
+  // constantly, and before this exemption every candidate mentioning a full
+  // commit SHA was silently dropped by the looksSecret sweep.
+  { name: 'entropy-blob', re: /\b(?![0-9a-fA-F]{40,}\b)[A-Za-z0-9+/]{40,}={0,2}\b/g },
 ];
 
 export interface RedactionResult {

@@ -32,6 +32,10 @@ export interface ConsolidationReport {
   deleted: number;
   kept: number;
   skipped: number;
+  /** Batches whose LLM call failed; the memories in them were NOT reviewed and are retried on the next trigger. */
+  failedBatches?: number;
+  /** One short, log-safe failure summary per failed batch. */
+  batchFailures?: string[];
   failure?: string;
 }
 
@@ -46,8 +50,18 @@ export interface ConsolidationOptions {
   taskContext?: TaskContext | null;
 }
 
-/** Per-call budget for the memory list. */
-const CONSOLIDATION_TOKEN_BUDGET = 9000;
+/**
+ * Per-call budget for the memory list.
+ *
+ * 4500 input tokens (was 9000): the consolidation model must emit one verdict
+ * line per memory in the batch, and a reasoning-style secondary model spends
+ * thousands of hidden tokens before the first byte of content. Batches half
+ * the size are twice as likely to finish inside the call budget and timeout,
+ * which live data showed as a chronic multi-batch failure mode: 402 failed
+ * calls out of 1125. The remaining backlog is picked up on the next trigger
+ * in either case - batches beyond MAX_BATCHES are deferred, not dropped.
+ */
+const CONSOLIDATION_TOKEN_BUDGET = 4500;
 const MAX_BATCHES = 6;
 
 export async function runConsolidation(options: ConsolidationOptions): Promise<ConsolidationReport> {
@@ -99,6 +113,12 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
   const truncated = batches.length > MAX_BATCHES;
   logger.info(`consolidating ${targets.length} memories in ${windowSize} batch(es)...`);
 
+  // A run that is cancelled mid-flight (extension unload) must be
+  // distinguishable from a failed batch so the caller can decide whether the
+  // work is complete.
+  let abortedDuringRun = false;
+  const batchFailures: string[] = [];
+
   for (let i = 0; i < windowSize; i++) {
     const batch = batches[i];
     const byId = new Map(batch.map((entry) => [entry.id, entry]));
@@ -127,9 +147,27 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
     if (!result.ok) {
       // An external abort (extension unload) is not an LLM failure.
       if (result.kind !== 'aborted') state.totals.llmFailures += 1;
-      report.failure = `batch ${i + 1}: ${result.kind} - ${result.message}`;
-      logger.warn(`consolidation stopped: ${report.failure}`);
-      break;
+
+      // Cancellation and deterministic config errors stop the run: retrying
+      // further batches is pointless when the caller asked to stop, or when
+      // every batch would fail the same configuration check.
+      if (result.kind === 'aborted' || result.kind === 'disabled') {
+        abortedDuringRun = result.kind === 'aborted';
+        report.failure = `batch ${i + 1}: ${result.kind} - ${result.message}`;
+        logger.warn(`consolidation stopped: ${report.failure}`);
+        break;
+      }
+
+      // Every other failure (timeout, unreachable, HTTP 5xx after retries,
+      // malformed/empty output) affects THIS batch only. Abandoning the whole
+      // run because one batch timed out - the previous behaviour - left the
+      // remaining batches unreviewed while still resetting the round counter,
+      // so on a 36% call-failure rate a run almost never completed (observed
+      // live: consolidation ran 6+ times, deleted 0). Skip the batch, keep
+      // going; the skipped memories are retried on the next trigger.
+      batchFailures.push(`batch ${i + 1}: ${result.kind}`);
+      logger.warn(`consolidation batch ${i + 1} failed (${result.kind}: ${result.message}) - continuing with the next batch`);
+      continue;
     }
 
     const parsed = parseStructured(ConsolidationSchema, result.text);
@@ -140,6 +178,16 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
     }
 
     await applyActions(parsed.data.actions, table, byId, memory, projectDir, report, config, state);
+  }
+
+  const failedBatches = batchFailures.length;
+  if (failedBatches > 0) {
+    report.failedBatches = failedBatches;
+    report.batchFailures = batchFailures;
+    if (failedBatches >= windowSize && !abortedDuringRun) {
+      // Nothing was reviewed in this run - that is a whole-run failure.
+      report.failure = `${failedBatches}/${windowSize} batches failed (${batchFailures.join('; ')})`;
+    }
   }
 
   const stats = projectStats(state, projectDir);
@@ -154,10 +202,23 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
       `consolidation: ${batches.length - windowSize} batch(es) beyond the ${MAX_BATCHES}-batch cap ` +
         'were not processed this run; they are picked up on the next consolidation trigger',
     );
+  } else if (failedBatches > 0 || abortedDuringRun) {
+    // Batch-skipping success: the run processed what it could, but at least
+    // one batch went unreviewed. Same principle as truncation - resetting the
+    // counter would schedule the next run past the unseen memories. Keep the
+    // counter above the interval so the next trigger retries them.
+    logger.warn(
+      `consolidation: ${failedBatches} batch(es) failed${abortedDuringRun ? ' before cancellation' : ''} ` +
+        'and were not reviewed; the round counter is kept so the next consolidation retries them',
+    );
   } else {
     stats.tasksSinceConsolidation = 0;
-    stats.lastConsolidationAt = Date.now();
   }
+  // A run that reviewed something counts as "last seen" - but NOT a truncated
+  // one: its window is not done, and `lastConsolidationAt` must not claim a
+  // backlog was processed (scenario 14). A cancelled run leaves the
+  // timestamp untouched as well.
+  if (!truncated && !abortedDuringRun) stats.lastConsolidationAt = Date.now();
   // Project counters must reflect consolidation too: `memory:stats` reads
   // these per-project numbers, and they used to show only extraction work, so
   // a project that merged 20 memories and deleted 15 reported none of it.
@@ -167,7 +228,8 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
 
   logger.info(
     `consolidation: scanned ${report.scanned} -> merged ${report.merged}, ` +
-      `updated ${report.updated}, deleted ${report.deleted}, kept ${report.kept}, skipped ${report.skipped}`,
+      `updated ${report.updated}, deleted ${report.deleted}, kept ${report.kept}, skipped ${report.skipped}` +
+      (failedBatches > 0 ? `, failed_batches ${failedBatches}` : ''),
   );
 
   return report;

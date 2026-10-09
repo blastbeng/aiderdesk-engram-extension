@@ -35,6 +35,11 @@
  * the destructive clear is guarded by "confirm" and scoped to the project,
  * memory:forget reports usage and deletes the best match, and onUnload cancels
  * a consolidation that is in flight against an endpoint that never answers.
+ * Scenario 16 covers the hardening regressions: a single failed
+ * consolidation batch must not abort the run (the surviving batches are
+ * reviewed, the round counter is kept so the skipped one is retried), and the
+ * secret redaction must not treat pure-hex hashes (git SHA-1/SHA-256) as
+ * tokens, while still redacting mixed high-entropy blobs.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -54,7 +59,8 @@ import { hasAgentOverride, mergeConfig, resolveConfig, type EngramConfig } from 
 import { logger } from '../src/logger';
 import { runExtraction, type ExtractionReport } from '../src/extraction';
 import { runConsolidation } from '../src/consolidation';
-import { retrieveForPrompt } from '../src/retrieval';
+import { lexicalOverlap, retrieveForPrompt } from '../src/retrieval';
+import { looksSecret, redactSecrets } from '../src/privacy';
 import { decodeMemory } from '../src/memory-format';
 import { deterministicDedup, importanceOf, metaForNew, statementOf } from '../src/store';
 import { loadState, projectStats, saveState, type EngramState } from '../src/state';
@@ -732,6 +738,46 @@ async function main(): Promise<void> {
       const some = await retrieveForPrompt(h.context, h.projectDir, 'which cluster does the deployment run on?', h.config);
       check(some.block !== null && some.count === 1, `an at-floor memory must be injected, got count=${some.count}`);
       check(/green cluster with blue workers/.test(some.block ?? ''), 'the injected statement must not carry the footer');
+
+      // Part C - the lexical overlap gate (retrieval.min_overlap, default 1).
+      // The host's global memory.maxDistance (shipped default 1.5 on 0..2
+      // cosine) is permissive enough that a function word alone ("which") gets
+      // a statement natively retrieved; the gate must cut exactly that.
+      check(
+        lexicalOverlap('which cluster does the deployment run on?', 'The deployment runs on the green cluster.') >= 2,
+        'content words shared by prompt and statement must count towards overlap',
+      );
+      check(
+        lexicalOverlap('which cluster does the deployment run on?', 'Ask which region the account was created in before scheduling.') === 0,
+        'a function word ("which") shared alone must never count as overlap',
+      );
+      check(
+        lexicalOverlap('come configurare nginx senza password', 'Nginx gira in container con la porta 8080 esposta.') >= 1,
+        'Italian prompts must share topic words with Italian statements',
+      );
+      await h.memory.storeMemory(
+        h.projectDir,
+        'off-0',
+        'code-pattern',
+        encodeForHarness('Ask which region the account was created in before scheduling.', {
+          category: 'configuration',
+          importance: 5,
+          scope: 'project',
+          confidence: 0.9,
+        }),
+      );
+      // The off-topic statement is importance 5 and natively retrieved (the
+      // mock scores "which" as a shared token), so only the overlap gate can
+      // be what drops it.
+      const gated = await retrieveForPrompt(h.context, h.projectDir, 'which cluster does the deployment run on?', h.config);
+      check(
+        gated.block !== null && gated.count === 1,
+        `the gate must keep only the statement sharing content words, got count=${gated.count}`,
+      );
+      check(!/scheduling/.test(gated.block ?? ''), 'the function-word-only match must be dropped');
+      const inclusive = { ...h.config, retrieval: { ...h.config.retrieval, min_overlap: 0 } };
+      const all = await retrieveForPrompt(h.context, h.projectDir, 'which cluster does the deployment run on?', inclusive);
+      check(all.count === 2, `min_overlap = 0 must disable the gate and inject both hits, got count=${all.count}`);
     } finally {
       await h.close();
     }
@@ -1182,6 +1228,118 @@ async function main(): Promise<void> {
         rmSync(dir, { recursive: true, force: true });
         await h.close();
         await slow.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 16
+  await scenario(
+    '16. A failed consolidation batch is skipped and not fatal, and pure-hex hashes are not treated as secrets',
+    async () => {
+      // Part B - privacy: the entropy-blob rule must not fire on pure
+      // hexadecimal tokens. A 40-64 char hex string is a git/object hash or a
+      // digest, which appears in coding transcripts constantly; the pre-fix
+      // rule silently dropped every candidate quoting a full commit SHA
+      // (looksSecret) and mangled the transcript sent to the secondary LLM.
+      {
+        const sha1 = '124fc07a46a760d789635e47c278933cf6b28c2b';
+        const sha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+        check(redactSecrets(`fixed in commit ${sha1}`, true).hits === 0, 'a full SHA-1 must not be redacted');
+        check(redactSecrets(`the digest is ${sha256}`, true).hits === 0, 'a SHA-256 digest must not be redacted');
+        check(
+          looksSecret(`The regression was fixed in commit ${sha1}.`, true) === false,
+          'a candidate quoting a commit hash must not be dropped as a secret',
+        );
+        const mixedBlob = 'AE3xKv9pQm2Rt7Ws5Yz1Bd4Cf6Gh8Jk0Lu3Nv2Xc9Zq1';
+        check(
+          redactSecrets(`the token is ${mixedBlob}`, true).hits >= 1,
+          'a mixed-case 40+ char blob must still be redacted',
+        );
+        check(
+          redactSecrets('Authorization: Bearer abcdefghijklmnop1234', true).hits >= 1,
+          'bearer credentials must still be redacted',
+        );
+        check(redactSecrets('sk-1234567890abcdef12', true).hits >= 1, 'OpenAI-style keys must still be redacted');
+      }
+
+      // Part A - consolidation hardening: one batch exhausts its retry ladder
+      // against a 503, the run must still review the remaining batch instead
+      // of aborting, and the round counter must be kept so the skipped batch
+      // is retried on the next trigger. The pre-fix behaviour broke the whole
+      // run on the first failure - with a high call-failure rate a multi-batch
+      // run almost never completed - while still resetting the counter.
+      const big = 'The regression corpus sentence is deliberately long. '.repeat(680); // each ~ 10k est. tokens > batch budget
+      let consolidationCalls = 0;
+      const scripted = scriptedResponder();
+      const h = await makeHarness((body) => {
+        if (/consolidat/i.test(systemOf(body))) {
+          consolidationCalls += 1;
+          if (consolidationCalls <= 3) return { status: 503, message: 'upstream overloaded' };
+        }
+        return scripted(body);
+      });
+      try {
+        await h.memory.storeMemory(
+          h.projectDir,
+          'big-a',
+          'code-pattern',
+          encodeForHarness(`${big} variant alpha.`, {
+            category: 'configuration',
+            importance: 3,
+            scope: 'project',
+            confidence: 0.9,
+          }),
+        );
+        await h.memory.storeMemory(
+          h.projectDir,
+          'big-b',
+          'code-pattern',
+          encodeForHarness(`${big} variant beta.`, {
+            category: 'configuration',
+            importance: 3,
+            scope: 'project',
+            confidence: 0.9,
+          }),
+        );
+
+        const stats = projectStats(h.state, h.projectDir);
+        stats.tasksSinceConsolidation = 20;
+        saveState(h.statePath, h.state);
+
+        const report = await runConsolidation({
+          context: h.context,
+          projectDir: h.projectDir,
+          config: h.config,
+          state: h.state,
+          statePath: h.statePath,
+          taskContext: null,
+        });
+
+        check(report.scanned === 2, `expected to scan 2 memories, scanned ${report.scanned}`);
+        check(report.failedBatches === 1, `exactly one batch must be marked failed, got ${report.failedBatches}`);
+        check(
+          !report.failure,
+          `a partially successful run must not be reported as a whole-run failure, got: ${report.failure}`,
+        );
+        check(report.kept === 1, `the surviving batch's memory must count as kept, got kept=${report.kept}`);
+        check(
+          consolidationCalls === 4,
+          `the failed batch must consume its 3 retry attempts before the next batch runs, saw ${consolidationCalls} consolidation call(s)`,
+        );
+        check(
+          projectStats(h.state, h.projectDir).tasksSinceConsolidation === 20,
+          'the round counter must be kept while at least one batch went unreviewed',
+        );
+        check(
+          typeof projectStats(h.state, h.projectDir).lastConsolidationAt === 'number',
+          'a run that processed a batch must still stamp lastConsolidationAt',
+        );
+        check(
+          h.state.totals.llmFailures === 1,
+          `one exhausted retry ladder must count as one logical failure, got ${h.state.totals.llmFailures}`,
+        );
+      } finally {
+        await h.close();
       }
     },
   );

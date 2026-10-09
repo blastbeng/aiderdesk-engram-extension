@@ -337,6 +337,12 @@
               onChange={(e) => setRetrieval({ min_importance: num(e.target.value, 3) })}
               placeholder="3"
             />
+            <Input
+              label="Min word overlap with prompt"
+              value={String(retrieval.min_overlap ?? 1)}
+              onChange={(e) => setRetrieval({ min_overlap: num(e.target.value, 1) })}
+              placeholder="1"
+            />
           </div>
           <Checkbox
             label="Include global-scope memories"
@@ -344,9 +350,11 @@
             onChange={(checked) => setRetrieval({ include_global: checked })}
           />
           <p className="text-xs text-text-secondary -mt-2">
-            AiderDesk applies one global similarity threshold (Settings &gt; Memory), not a per-call one, so "Min relevance"
-            is only a hint. Memories are injected in vector-search order (most relevant first) and filtered by the
-            "Min importance to inject" floor. If nothing qualifies, nothing is added to the context.
+            AiderDesk applies one global similarity threshold (Settings &gt; Memory), not a per-call one, and its default is
+            permissive: the vector search may return a full page of loosely related memories for any prompt. Memories are
+            injected most-relevant-first, filtered by the "Min importance to inject" floor, and then by "Min word overlap
+            with prompt": a memory must share at least that many distinct content words with the current prompt (0 disables
+            the gate). If nothing qualifies, nothing is added to the context.
           </p>
 
           <Section title="Consolidation" />

@@ -101,7 +101,7 @@ function say(context: ExtensionContext, level: 'info' | 'warn' | 'warning' | 'er
 export default class EngramMemoryExtension implements Extension {
   static metadata = {
     name: 'Engram Memory',
-    version: '1.2.0',
+    version: '1.3.0',
     description:
       'Automatic long-term memory: extracts durable facts from conversations with a secondary local OpenAI-compatible LLM, dedupes/updates/resolves conflicts in AiderDesk Memory, consolidates periodically, and injects only relevant memories.',
     author: 'local',
@@ -492,7 +492,11 @@ export default class EngramMemoryExtension implements Extension {
             const line = report.failure
               ? `consolidation failed: ${report.failure}`
               : `consolidated ${report.scanned} memories -> merged ${report.merged}, updated ${report.updated}, deleted ${report.deleted}, kept ${report.kept}`;
-            say(ctx, 'info', `[Memory] ${line}`);
+            const failedNote =
+              report.failedBatches && !report.failure
+                ? ` (${report.failedBatches} batch(es) failed${report.batchFailures?.length ? `: ${report.batchFailures.slice(0, 2).join('; ')}` : ''} - retried on the next consolidation)`
+                : '';
+            say(ctx, 'info', `[Memory] ${line}${failedNote}`);
           });
         },
       },
@@ -548,7 +552,7 @@ export default class EngramMemoryExtension implements Extension {
             `[Memory] project counters: extractions ${stats.extractions}, stored ${stats.stored}, updated ${stats.updated}, deleted ${stats.deleted}, duplicates ${stats.duplicates}, obsolete ${stats.obsolete}`,
             `[Memory] totals: LLM calls ${this.state.totals.llmCalls} (failures ${this.state.totals.llmFailures}), stored ${this.state.totals.stored}, updated ${this.state.totals.updated}, deleted ${this.state.totals.deleted}`,
             `[Memory] extraction: enabled=${cfg.extraction.enabled} trigger=${cfg.extraction.trigger} min_importance=${cfg.extraction.min_importance}`,
-            `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories} min_importance=${cfg.retrieval.min_importance}`,
+            `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories} min_importance=${cfg.retrieval.min_importance} min_overlap=${cfg.retrieval.min_overlap}`,
             `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${cfg.consolidation.interval_tasks} rounds, safe_mode=${cfg.consolidation.safe_mode}`,
             `[Memory] secondary LLM: ${cfg.secondary_llm.model} @ ${cfg.secondary_llm.base_url}`,
           ];

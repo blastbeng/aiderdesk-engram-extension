@@ -102,6 +102,24 @@ export interface RetrievalConfig {
    * the importance floor.)
    */
   min_importance: number;
+  /**
+   * Lexical overlap gate for injection (default 1, 0 = disabled).
+   *
+   * A retrieved memory must share at least this many distinct content words
+   * (stopwords and words < 3 chars excluded, English + Italian stopword lists)
+   * with the current prompt to be injected. The host's vector search applies a
+   * GLOBAL `memory.maxDistance` cutoff - its shipped default is 1.5 on a 0..2
+   * cosine scale, which is permissive enough to return a full page of hits for
+   * almost any query - and `MemoryEntry` carries no distance, so the extension
+   * cannot re-rank or re-filter by similarity (see src/retrieval.ts). This
+   * per-call lexical floor is the one precision lever the extension actually
+   * controls: it keeps semantically unrelated "durable facts" out of the main
+   * model's context even when the native store matches generously.
+   *
+   * Raise it (2-3) for stricter precision; set 0 to inject everything the
+   * native store returns that clears the importance floor.
+   */
+  min_overlap: number;
   /** Include global-scope memories (projectId === '') alongside project memories. */
   include_global: boolean;
 }
@@ -190,6 +208,7 @@ export const DEFAULT_CONFIG: EngramConfig = {
     enabled: true,
     max_memories: 8,
     min_importance: 3,
+    min_overlap: 1,
     include_global: true,
   },
   consolidation: {
@@ -248,6 +267,7 @@ const SECTION_KEYS = {
     enabled: isBoolean,
     max_memories: isNumber,
     min_importance: isNumber,
+    min_overlap: isNumber,
     include_global: isBoolean,
   },
   consolidation: {

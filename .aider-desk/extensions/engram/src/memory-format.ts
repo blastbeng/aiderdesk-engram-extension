@@ -195,14 +195,18 @@ export function memoryForPrompt(id: string, content: string): string {
 
 /**
  * Clean block injected into the main model's context. No footer noise.
+ *
+ * Each statement is hard-capped: the injected block must stay a bounded,
+ * predictable cost (max_memories x ~75 words), so one pathological candidate
+ * can never eat the context budget the block was sized for.
  */
 export function formatRetrievedBlock(memories: { content: string; projectId?: string }[]): string {
   const lines = memories.map((m) => {
     const decoded = decodeMemory(m.content);
-    const statement = decoded ? decoded.statement : stripFooter(m.content);
+    const statement = (decoded ? decoded.statement : stripFooter(m.content)).replace(/\s+/g, ' ').trim();
     const scope = decoded ? decoded.meta.scope : m.projectId ? 'project' : 'global';
     const imp = decoded ? decoded.meta.importance : 3;
-    return `- (${scope}, i${imp}) ${statement}`;
+    return `- (${scope}, i${imp}) ${statement.slice(0, 300)}`;
   });
   return lines.join('\n');
 }
