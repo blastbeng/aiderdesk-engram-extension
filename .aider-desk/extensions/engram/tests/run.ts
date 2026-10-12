@@ -39,7 +39,20 @@
  * consolidation batch must not abort the run (the surviving batches are
  * reviewed, the round counter is kept so the skipped one is retried), and the
  * secret redaction must not treat pure-hex hashes (git SHA-1/SHA-256) as
- * tokens, while still redacting mixed high-entropy blobs.
+ * tokens, while still redacting mixed high-entropy blobs. Scenario 17 covers
+ * the activity surface: the status-bar badge and its data/actions, a
+ * task-scoped feed that a real extraction round lands in, the task-log dump,
+ * a command that must not record itself into the feed it prints, and an
+ * endpoint that must reach the viewer with its credentials stripped.
+ * Scenario 18 covers "spend tokens only while the task runs": subagent,
+ * compaction and conflict-resolution agent runs must not trigger extraction or
+ * reach the secondary LLM, while a real task turn still does. Scenario 19
+ * covers the consolidation cooldown: a backlog left over the interval must not
+ * retry an automatic consolidation on every subsequent round.
+ * Scenario 20 covers the "what is the secondary LLM actually putting into my
+ * Memory, and what is it reading back out" surface: statements are absent from
+ * the feed and from the memories view while `ui.show_content` is off, appear
+ * once it is on, and reach the viewer secret-redacted in both cases.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -52,9 +65,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { AgentFinishedEvent, ContextMessage } from '@aiderdesk/extensions';
+import type {
+  AgentFinishedEvent,
+  ContextMessage,
+  ImportantRemindersEvent,
+  PromptStartedEvent,
+} from '@aiderdesk/extensions';
 
 import { aliasFor, buildAliasTable, resolveAlias } from '../src/aliases';
+import { safeEndpoint, sanitizeStatements, type ActivityEntry } from '../src/activity';
 import { hasAgentOverride, mergeConfig, resolveConfig, type EngramConfig } from '../src/config';
 import { logger } from '../src/logger';
 import { runExtraction, type ExtractionReport } from '../src/extraction';
@@ -1056,6 +1075,7 @@ async function main(): Promise<void> {
           'memory:extract',
           'memory:consolidate',
           'memory:dedup',
+          'memory:activity',
           'memory:stats',
           'memory:forget',
           'memory:clear-project',
@@ -1607,6 +1627,597 @@ async function scenario14(): Promise<void> {
         } finally {
           await h.close();
         }
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 17
+  await scenario(
+    '17. Activity surface: a per-task feed the badge reads, UI actions, credential-stripped status, and no self-pollution',
+    async () => {
+      const h = await makeHarness(scriptedResponder());
+      const dir = mkdtempSync(join(tmpdir(), 'engram-activity-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+
+      writeFileSync(configPath, JSON.stringify(h.config, null, 2), 'utf-8');
+      EngramMemoryExtension.testPaths = { configPath, statePath };
+
+      const readEntries = async (
+        ext: EngramMemoryExtension,
+        ctx: ReturnType<typeof mockExtensionContext>,
+        opts: Record<string, unknown>,
+      ): Promise<ActivityEntry[]> => {
+        const result = (await ext.executeUIExtensionAction('engram-activity', 'activity', [opts], ctx)) as {
+          entries: ActivityEntry[];
+        };
+        return result.entries;
+      };
+
+      try {
+        const ext = new EngramMemoryExtension();
+        const taskCtx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-activity',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await ext.onLoad(taskCtx);
+
+        // ---- A. The badge is registered and configured to load its data.
+        const components = ext.getUIComponents(taskCtx);
+        check(components.length === 1, `expected 1 UI component, got ${components.length}`);
+        const badge = components[0];
+        check(badge.id === 'engram-activity', `unexpected component id ${badge.id}`);
+        check(badge.placement === 'task-status-bar-right', `unexpected placement ${badge.placement}`);
+        check(typeof badge.jsx === 'string' && badge.jsx.length > 0, 'the badge has no JSX');
+        check(badge.loadData === true, 'the badge must load its data via getUIExtensionData');
+
+        // ---- B. The status header is credential-free and carries the counters.
+        const status = (await ext.getUIExtensionData('engram-activity', taskCtx)) as {
+          version: string;
+          memoryAvailable: boolean;
+          activity: { size: number; warnings: number; errors: number };
+          llm: { endpoint: string };
+          project: { dir: string };
+        };
+        check(typeof status.version === 'string' && status.version.length > 0, 'status must carry a version');
+        check(status.memoryAvailable === true, 'status must report that AiderDesk Memory is available');
+        check(typeof status.activity.size === 'number', 'status must carry the feed size');
+        check(status.project.dir === h.projectDir, 'status must carry the project dir');
+        check(
+          !safeEndpoint('http://user:secret@host:4000/v1').includes('secret'),
+          'safeEndpoint must strip credentials embedded in a base URL',
+        );
+        check(
+          (await ext.getUIExtensionData('some-other-component', taskCtx)) === undefined,
+          'an unknown component id must not leak data',
+        );
+
+        // ---- C. A real extraction round lands in the task-scoped feed.
+        const beforeTask = await readEntries(ext, taskCtx, { scope: 'task', taskId: 'task-activity' });
+        const started = (await ext.executeUIExtensionAction('engram-activity', 'extract', [{}], taskCtx)) as {
+          started?: boolean;
+        };
+        check(started.started === true, 'the "Extract now" action must start a round');
+        await ext.drainQueues();
+        const afterTask = await readEntries(ext, taskCtx, { scope: 'task', taskId: 'task-activity' });
+        check(afterTask.length > beforeTask.length, 'the extraction round must appear in the task feed');
+        check(afterTask.some((e) => e.kind === 'extraction'), 'the feed must contain an extraction entry');
+        check(
+          afterTask.every((e) => !e.taskId || e.taskId === 'task-activity'),
+          'a task-scoped feed must never leak another task',
+        );
+        check(h.memory.count() >= 1, 'the extraction must have stored at least one memory');
+
+        // ---- D. "To task log" prints a header plus one line per entry.
+        const dump = (await ext.executeUIExtensionAction(
+          'engram-activity',
+          'dump',
+          [{ taskId: 'task-activity', scope: 'task' }],
+          taskCtx,
+        )) as { lines: string[]; count: number };
+        check(dump.count > 0, 'the dump must include entries');
+        check(
+          dump.lines.length === dump.count + 1,
+          `the dump must print a header plus one line per entry, got ${dump.lines.length} for ${dump.count}`,
+        );
+        check(logMessages.some((l) => l.includes('activity:')), 'the dump must reach the task log');
+
+        // ---- E. The command prints the feed WITHOUT recording itself (no loop).
+        const feedBeforeCommand = await readEntries(ext, taskCtx, { scope: 'all' });
+        await ext.getCommands(taskCtx).find((c) => c.name === 'memory:activity')!.execute([], taskCtx);
+        check(logMessages.some((l) => l.includes('activity:')), 'memory:activity must print the feed');
+        const feedAfterCommand = await readEntries(ext, taskCtx, { scope: 'all' });
+        check(
+          feedAfterCommand.length === feedBeforeCommand.length,
+          'memory:activity must not add entries about itself to the feed',
+        );
+
+        // ---- F. Clear empties the feed.
+        const cleared = (await ext.executeUIExtensionAction('engram-activity', 'clear', [{}], taskCtx)) as {
+          entries: ActivityEntry[];
+        };
+        check(Array.isArray(cleared.entries) && cleared.entries.length === 0, 'clear must return an empty feed');
+        check((await readEntries(ext, taskCtx, { scope: 'all' })).length === 0, 'the feed must be empty after clear');
+
+        // ---- G. show_activity=false removes the badge entirely.
+        writeFileSync(
+          configPath,
+          JSON.stringify(mergeConfig({ ...h.config, ui: { show_activity: false, activity_limit: 200 } }), null, 2),
+          'utf-8',
+        );
+        const offExt = new EngramMemoryExtension();
+        await offExt.onLoad(taskCtx);
+        check(offExt.getUIComponents(taskCtx).length === 0, 'show_activity=false must hide the badge');
+
+        // ---- H. A credential-bearing base URL never reaches the viewer.
+        writeFileSync(
+          configPath,
+          JSON.stringify(
+            mergeConfig({
+              ...h.config,
+              secondary_llm: { ...h.config.secondary_llm, base_url: 'http://user:secret@127.0.0.1:9/v1' },
+            }),
+            null,
+            2,
+          ),
+          'utf-8',
+        );
+        const credExt = new EngramMemoryExtension();
+        await credExt.onLoad(taskCtx);
+        const credStatus = (await credExt.getUIExtensionData('engram-activity', taskCtx)) as { llm: { endpoint: string } };
+        check(!credStatus.llm.endpoint.includes('secret'), `the endpoint must be credential-free, got ${credStatus.llm.endpoint}`);
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 18
+  await scenario(
+    '18. Tokens are spent only on task turns: subagent/compaction/conflict runs never extract',
+    async () => {
+      const h = await makeHarness(scriptedResponder());
+      const dir = mkdtempSync(join(tmpdir(), 'engram-mode-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+
+      writeFileSync(configPath, JSON.stringify(h.config, null, 2), 'utf-8');
+      EngramMemoryExtension.testPaths = { configPath, statePath };
+
+      try {
+        const ext = new EngramMemoryExtension();
+        const sink = createLogSink();
+        const ctx = mockExtensionContext(h.memory, h.projectDir, {
+          sink,
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-mode',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await ext.onLoad(ctx);
+
+        const finished = (mode: string): AgentFinishedEvent =>
+          ({ mode, aborted: false, contextMessages: LLAMA_CONVERSATION(), resultMessages: [] }) as AgentFinishedEvent;
+
+        // Every internal run AiderDesk dispatches through onAgentFinished must
+        // be ignored: no secondary-LLM call, no stored memory, no queue work.
+        const callsBefore = h.server.requests.length;
+        for (const mode of ['subagent', 'compact-conversation', 'conflict-resolution']) {
+          await ext.onAgentFinished(finished(mode), ctx);
+        }
+        await ext.drainQueues();
+        check(
+          h.server.requests.length === callsBefore,
+          `internal agent modes must not reach the secondary LLM (${h.server.requests.length - callsBefore} calls)`,
+        );
+        check(h.memory.count() === 0, `internal agent modes must store nothing, got ${h.memory.count()}`);
+        check(
+          sink.lines.some((l) => l.message.includes('skipping subagent run')),
+          `the skip must be visible in the log, got: ${sink.lines.map((l) => l.message).join(' | ')}`,
+        );
+
+        // A real task turn still extracts and stores.
+        await ext.onAgentFinished(finished('agent'), ctx);
+        await ext.drainQueues();
+        check(h.server.requests.length > callsBefore, 'a real task turn must contact the secondary LLM');
+        check(h.memory.count() === 1, `a real task turn must store a memory, got ${h.memory.count()}`);
+
+        // Aborted runs are skipped regardless of mode (unchanged behaviour).
+        const callsAfterTurn = h.server.requests.length;
+        await ext.onAgentFinished(
+          { mode: 'agent', aborted: true, contextMessages: LLAMA_CONVERSATION(), resultMessages: [] } as AgentFinishedEvent,
+          ctx,
+        );
+        await ext.drainQueues();
+        check(
+          h.server.requests.length === callsAfterTurn,
+          'an aborted run must not contact the secondary LLM',
+        );
+
+        await ext.onUnload();
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 19
+  await scenario(
+    '19. Automatic consolidation is rate-limited: a failed backlog cannot retry on every round',
+    async () => {
+      const failingConsolidation: Responder = (body) => {
+        const system = body.messages?.find((m) => m.role === 'system')?.content ?? '';
+        if (/consolidat/i.test(system)) return { status: 500, message: 'mock consolidation outage' };
+        return scriptedResponder()(body);
+      };
+      const h = await makeHarness(failingConsolidation);
+      const dir = mkdtempSync(join(tmpdir(), 'engram-cooldown-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+
+      // interval_tasks 2 => threshold 2, so the seeded counter is already over.
+      writeFileSync(
+        configPath,
+        JSON.stringify({ ...h.config, consolidation: { enabled: true, interval_tasks: 2, safe_mode: true } }, null, 2),
+        'utf-8',
+      );
+      EngramMemoryExtension.testPaths = { configPath, statePath };
+
+      const isConsolidationCall = (req: { messages?: { role: string; content: string }[] }): boolean =>
+        /consolidat/i.test(systemOf(req));
+
+      try {
+        // Two managed memories, so consolidation has real work to send to the
+        // LLM (fewer than 2 targets short-circuits without a model call).
+        for (let i = 0; i < 2; i++) {
+          h.memory.seed(
+            randomUUID(),
+            h.projectDir,
+            'code-pattern',
+            encodeForHarness(`The build pipeline ${i} caches its docker layers for an hour.`, {
+              category: 'configuration',
+              importance: 4,
+              scope: 'project',
+              confidence: 0.9,
+            }),
+          );
+        }
+        // The extension loads its own state at construction, so the backlog
+        // counter must be on disk BEFORE it is built.
+        const seeded = loadState(statePath);
+        projectStats(seeded, h.projectDir).tasksSinceConsolidation = 5;
+        saveState(statePath, seeded);
+
+        const ext = new EngramMemoryExtension();
+        const ctx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-cooldown',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await ext.onLoad(ctx);
+        const finished = (): AgentFinishedEvent =>
+          ({ mode: 'agent', aborted: false, contextMessages: LLAMA_CONVERSATION(), resultMessages: [] }) as AgentFinishedEvent;
+
+        // Round 1: over the interval, so a consolidation is attempted - and
+        // every batch fails, which is exactly the state that keeps the counter
+        // above the interval so the next trigger retries the backlog.
+        await ext.onAgentFinished(finished(), ctx);
+        await ext.drainQueues();
+        const afterFirst = h.server.requests.filter(isConsolidationCall).length;
+        check(afterFirst >= 1, `the first over-threshold round must attempt a consolidation (calls ${h.server.requests.length})`);
+        check(
+          projectStats(loadState(statePath), h.projectDir).tasksSinceConsolidation >= 2,
+          'a run whose batches all failed must keep the round counter above the interval',
+        );
+
+        // Round 2: still over the interval, inside the cooldown. Without the
+        // cooldown this is where the production retry storm came from.
+        await ext.onAgentFinished(finished(), ctx);
+        await ext.drainQueues();
+        const afterSecond = h.server.requests.filter(isConsolidationCall).length;
+        check(
+          afterSecond === afterFirst,
+          `a second round inside the cooldown must not consolidate again (${afterSecond - afterFirst} extra call(s))`,
+        );
+
+        await ext.onUnload();
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 20
+  await scenario(
+    '20. Statements surface: what the LLM wrote and what it injected, opt-in and secret-redacted',
+    async () => {
+      const h = await makeHarness(scriptedResponder());
+      const dir = mkdtempSync(join(tmpdir(), 'engram-content-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+
+      const writeConfig = (ui: Record<string, unknown>): void => {
+        writeFileSync(
+          configPath,
+          JSON.stringify(
+            mergeConfig({ ...h.config, ui: { show_activity: true, activity_limit: 200, ...ui } }),
+            null,
+            2,
+          ),
+          'utf-8',
+        );
+      };
+
+      const readEntries = async (
+        ext: EngramMemoryExtension,
+        ctx: ReturnType<typeof mockExtensionContext>,
+        opts: Record<string, unknown>,
+      ): Promise<ActivityEntry[]> => {
+        const result = (await ext.executeUIExtensionAction('engram-activity', 'activity', [opts], ctx)) as {
+          entries: ActivityEntry[];
+        };
+        return result.entries;
+      };
+
+      interface MemoriesRow {
+        id: string;
+        scope: 'global' | 'project';
+        category: string;
+        importance: number;
+        statement?: string;
+      }
+      const readMemories = async (
+        ext: EngramMemoryExtension,
+        ctx: ReturnType<typeof mockExtensionContext>,
+      ): Promise<{ items: MemoriesRow[]; total: number; showContent: boolean }> =>
+        (await ext.executeUIExtensionAction('engram-activity', 'memories', [{ limit: 200 }], ctx)) as {
+          items: MemoriesRow[];
+          total: number;
+          showContent: boolean;
+        };
+
+      /** A secret a model might write into a memory, to prove the viewer redacts it. */
+      const SECRET = 'sk-FAKESECRETKEY000';
+
+      /** The conversation the "prefers local models" rule of the mock model reacts to. */
+      const prefConversation = (): ContextMessage[] => [
+        userMsg('Standing note: the user prefers local models over any cloud API.'),
+        assistantMsg('Understood - inference stays on the local llama-server, no cloud calls.'),
+        toolMsg(['read_file']),
+        assistantMsg('Noted: local models only.'),
+      ];
+
+      try {
+        // ---- A. Default: the viewer shows counts, never statements.
+        writeConfig({});
+        EngramMemoryExtension.testPaths = { configPath, statePath };
+
+        const offExt = new EngramMemoryExtension();
+        const offCtx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-content-off',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await offExt.onLoad(offCtx);
+
+        const offStatus = (await offExt.getUIExtensionData('engram-activity', offCtx)) as {
+          ui: { showContent: boolean };
+        };
+        check(offStatus.ui.showContent === false, 'show_content must default to off');
+
+        const offRun = (await offExt.executeUIExtensionAction('engram-activity', 'extract', [{}], offCtx)) as {
+          started?: boolean;
+        };
+        check(offRun.started === true, 'the "Extract now" action must start a round');
+        await offExt.drainQueues();
+        check(h.memory.count() >= 1, `the round must have stored a memory, got ${h.memory.count()}`);
+
+        const offFeed = await readEntries(offExt, offCtx, { scope: 'task', taskId: 'task-content-off' });
+        const offExtraction = offFeed.filter((e) => e.kind === 'extraction');
+        check(offExtraction.length >= 1, 'the round must record an extraction entry');
+        check(
+          offExtraction.every((e) => e.content === undefined),
+          'with show_content off the feed must carry no statements',
+        );
+
+        const offList = await readMemories(offExt, offCtx);
+        check(offList.showContent === false, 'the memories view must report statements as hidden');
+        check(offList.total >= 1, `the memories view must list the stored memory, got ${offList.total}`);
+        check(
+          offList.items.every((item) => item.statement === undefined),
+          'with show_content off the memories view must return no statements',
+        );
+
+        const offDump = (await offExt.executeUIExtensionAction(
+          'engram-activity',
+          'dump',
+          [{ scope: 'all' }],
+          offCtx,
+        )) as { lines: string[]; count: number };
+        check(
+          offDump.lines.length === offDump.count + 1,
+          `with show_content off the dump must print one line per entry, got ${offDump.lines.length} for ${offDump.count}`,
+        );
+        await offExt.onUnload();
+
+        // ---- B. show_content on: the writes, the injections and the store rows are listed.
+        writeConfig({ show_content: true });
+        const ext = new EngramMemoryExtension();
+        const sink = createLogSink();
+        const ctx = mockExtensionContext(h.memory, h.projectDir, {
+          sink,
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-content-on',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: prefConversation(),
+          }),
+        });
+        await ext.onLoad(ctx);
+
+        const onStatus = (await ext.getUIExtensionData('engram-activity', ctx)) as {
+          ui: { showContent: boolean };
+        };
+        check(onStatus.ui.showContent === true, 'show_content must reach the viewer status');
+
+        const onRun = (await ext.executeUIExtensionAction('engram-activity', 'extract', [{}], ctx)) as {
+          started?: boolean;
+        };
+        check(onRun.started === true, 'the "Extract now" action must start a round');
+        await ext.drainQueues();
+
+        const onFeed = await readEntries(ext, ctx, { scope: 'task', taskId: 'task-content-on' });
+        const written = onFeed.filter((e) => e.kind === 'extraction' && (e.content?.length ?? 0) > 0);
+        check(written.length >= 1, 'an extraction entry must carry the statements it wrote');
+        check(
+          written.some((e) => (e.content ?? []).some((line) => line.startsWith('stored: '))),
+          `the write list must name the stored statement, got ${JSON.stringify(written.map((e) => e.content))}`,
+        );
+        check(
+          written.some((e) => (e.content ?? []).some((line) => /running models locally/i.test(line))),
+          'the stored statement must be the fact the model extracted',
+        );
+
+        // ---- C. Retrieval reports what it injected - with secrets redacted.
+        // A memory that already carries a secret (written before redaction
+        // existed, or by another tool): the viewer must never show the raw key.
+        h.memory.seed(
+          randomUUID(),
+          h.projectDir,
+          'code-pattern',
+          encodeForHarness(`The deploy token is ${SECRET} and the deployment runs on the green cluster.`, {
+            category: 'configuration',
+            importance: 4,
+            scope: 'project',
+            confidence: 0.9,
+          }),
+        );
+
+        await ext.onPromptStarted(
+          { prompt: 'which deploy token does the deployment on the green cluster use?', mode: 'agent' } as unknown as PromptStartedEvent,
+          ctx,
+        );
+        const injected = (await ext.onImportantReminders(
+          { remindersContent: '', agentProfile: { id: 'local' } } as unknown as ImportantRemindersEvent,
+          ctx,
+        )) as Partial<ImportantRemindersEvent> | undefined;
+        check(
+          /<engram-memory-context>/.test(injected?.remindersContent ?? ''),
+          'the reminder hook must inject the memory block',
+        );
+
+        const afterInject = await readEntries(ext, ctx, { scope: 'task', taskId: 'task-content-on' });
+        const injectEntries = afterInject.filter((e) => e.kind === 'retrieval' && (e.content?.length ?? 0) > 0);
+        check(injectEntries.length >= 1, 'the retrieval entry must carry the statements it injected');
+        check(
+          injectEntries.some((e) => (e.content ?? []).some((line) => /green cluster/i.test(line))),
+          `the injected statement must be listed, got ${JSON.stringify(injectEntries.map((e) => e.content))}`,
+        );
+        check(
+          injectEntries.some((e) => (e.content ?? []).some((line) => line.includes('[REDACTED]'))),
+          'an injected secret must be redacted in the viewer',
+        );
+        check(
+          JSON.stringify(afterInject).includes(SECRET) === false,
+          'the raw secret must never reach the activity feed',
+        );
+
+        // ---- D. The memories view lists the store rows, statements included.
+        const onList = await readMemories(ext, ctx);
+        check(onList.showContent === true, 'the memories view must report statements as shown');
+        check(onList.total >= 2, `the memories view must list every managed row, got ${onList.total}`);
+        check(
+          onList.items.every((item) => typeof item.statement === 'string' && item.statement.length > 0),
+          'with show_content on every row must carry its statement',
+        );
+        check(
+          onList.items.every((item) => item.scope === 'project' || item.scope === 'global'),
+          'rows must be scoped',
+        );
+        check(
+          onList.items.some((item) => (item.statement ?? '').includes('[REDACTED]')),
+          'the memories view must redact a stored secret',
+        );
+        check(
+          onList.items.every((item) => (item.statement ?? '').includes(SECRET) === false),
+          'the memories view must never return a raw secret',
+        );
+        check(
+          onList.items.every((item) => item.importance >= 1),
+          'rows must carry their importance',
+        );
+
+        // ---- E. The task-log dump prints the statements too.
+        const onDump = (await ext.executeUIExtensionAction(
+          'engram-activity',
+          'dump',
+          [{ scope: 'all' }],
+          ctx,
+        )) as { lines: string[]; count: number };
+        check(
+          onDump.lines.length > onDump.count + 1,
+          `with show_content on the dump must print the statements as extra lines, got ${onDump.lines.length} for ${onDump.count}`,
+        );
+        check(
+          onDump.lines.some((line) => line.includes('stored: ')),
+          'the dump must print the written statements',
+        );
+        check(
+          onDump.lines.every((line) => line.includes(SECRET) === false),
+          'the dump must never print a raw secret',
+        );
+
+        // ---- F. sanitizeStatements: redaction is not optional, and the caps hold.
+        const cleaned = sanitizeStatements([
+          `password: hunter2keep it safe`,
+          '   spaced   out   statement   ',
+          '',
+          'x'.repeat(400),
+          ...Array.from({ length: 40 }, (_, i) => `statement ${i}`),
+        ]);
+        check(cleaned.length <= 12, `sanitizeStatements must cap the list, got ${cleaned.length}`);
+        check(
+          cleaned.every((line) => line.length <= 220),
+          `sanitizeStatements must cap each statement, got ${Math.max(...cleaned.map((l) => l.length))}`,
+        );
+        check(cleaned.every((line) => line.includes('  ') === false), 'statements must be whitespace-collapsed');
+        check(cleaned[0].includes('hunter2keep') === false, 'a password assignment must be redacted');
+
+        await ext.onUnload();
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
       }
     },
   );

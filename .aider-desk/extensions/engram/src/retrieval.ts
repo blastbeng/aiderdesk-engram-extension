@@ -29,6 +29,14 @@ import { logger } from './logger';
 export interface RetrievalOutcome {
   block: string | null;
   count: number;
+  /** Store hits the native search returned, before the injection gates. */
+  hits: number;
+  /**
+   * The statements actually injected, in injection order. Raw store text: the
+   * viewer sanitizes it (secrets redacted, capped) before showing it, and only
+   * when the user turned on `ui.show_content`.
+   */
+  statements: string[];
 }
 
 /**
@@ -100,11 +108,11 @@ export async function retrieveForPrompt(
   prompt: string,
   config: EngramConfig,
 ): Promise<RetrievalOutcome> {
-  if (!config.retrieval.enabled) return { block: null, count: 0 };
-  if (!prompt.trim()) return { block: null, count: 0 };
+  if (!config.retrieval.enabled) return { block: null, count: 0, hits: 0, statements: [] };
+  if (!prompt.trim()) return { block: null, count: 0, hits: 0, statements: [] };
 
   const memory = getMemoryContextSafely(context);
-  if (!memory) return { block: null, count: 0 };
+  if (!memory) return { block: null, count: 0, hits: 0, statements: [] };
 
   const entries = await retrieveScoped(
     memory,
@@ -114,13 +122,13 @@ export async function retrieveForPrompt(
     config.retrieval.include_global,
   );
 
-  if (!entries.length) return { block: null, count: 0 };
+  if (!entries.length) return { block: null, count: 0, hits: 0, statements: [] };
 
   const floor = Math.max(1, Math.round(config.retrieval.min_importance));
   const atFloor = entries.filter((entry) => importanceOf(entry) >= floor);
   if (!atFloor.length) {
     logger.debug(`retrieval: ${entries.length} hit(s) below importance floor - injected nothing`);
-    return { block: null, count: 0 };
+    return { block: null, count: 0, hits: entries.length, statements: [] };
   }
 
   // Overlap gate on top of the import floor. 0 disables it (inject everything
@@ -135,17 +143,22 @@ export async function retrieveForPrompt(
     logger.debug(
       `retrieval: ${atFloor.length} hit(s) failed the ${minOverlap}-word overlap gate - injected nothing`,
     );
-    return { block: null, count: 0 };
+    return { block: null, count: 0, hits: entries.length, statements: [] };
   }
 
   const block = formatRetrievedBlock(kept);
-  if (!block.trim()) return { block: null, count: 0 };
+  if (!block.trim()) return { block: null, count: 0, hits: entries.length, statements: [] };
 
   if (kept.length < entries.length) {
     logger.debug(`retrieval: gates dropped ${entries.length - kept.length} weak hit(s)`);
   }
   logger.info(`retrieval: injected ${kept.length} of ${entries.length} retrieved memories`);
-  return { block, count: kept.length };
+  return {
+    block,
+    count: kept.length,
+    hits: entries.length,
+    statements: kept.map((entry) => statementOf(entry)),
+  };
 }
 
 /**

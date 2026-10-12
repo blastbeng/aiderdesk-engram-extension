@@ -41,6 +41,9 @@
     consolidation: section('consolidation'),
     privacy: section('privacy'),
     logging: section('logging'),
+    // `ui` is global-only (never overridden per agent): the activity badge is
+    // one surface for the whole app.
+    ui: config?.ui || {},
   };
 
   // Write a field to the active scope. Global writes the section; an agent
@@ -71,6 +74,7 @@
   const setConsolidation = (patch) => write('consolidation', patch);
   const setPrivacy = (patch) => write('privacy', patch);
   const setLogging = (patch) => write('logging', patch);
+  const setUi = (patch) => write('ui', patch);
 
   const startCustom = () => {
     updateConfig({
@@ -90,6 +94,8 @@
   const consolidation = eff.consolidation;
   const privacy = eff.privacy;
   const logging = eff.logging;
+  const uiCfg = eff.ui;
+  const activityStatus = config?._activityStatus || null;
   const isNative = llm.transport === 'aiderdesk';
 
   const metaFor = (id) => agentsMeta.find((a) => a?.id === id) || {};
@@ -180,6 +186,47 @@
             When off, no extraction, retrieval or consolidation runs. Existing memories are left untouched.
             {agent ? ' For this agent only; use "Reset to inherit" to follow the global switch again.' : ''}
           </p>
+
+          {!agent ? (
+            <div className="flex flex-col gap-4">
+              <Section title="Activity viewer" />
+              <Checkbox
+                label="Show the Engram activity badge in the task status bar"
+                checked={uiCfg.show_activity !== false}
+                onChange={(checked) => setUi({ show_activity: checked })}
+              />
+              <Input
+                label="Activity entries kept in memory"
+                value={String(uiCfg.activity_limit ?? 200)}
+                onChange={(e) => setUi({ activity_limit: num(e.target.value, 200) })}
+                placeholder="200"
+              />
+              <Checkbox
+                label="Show memory statements (what was injected and written)"
+                checked={uiCfg.show_content === true}
+                onChange={(checked) => setUi({ show_content: checked })}
+              />
+              <p className="text-xs text-text-secondary -mt-2">
+                The badge opens a live, per-task view of what the extension is doing: retrieval hits, extraction
+                rounds, stored/updated/deleted counts, consolidation, warnings and errors, plus Extract now /
+                Consolidate / Refresh / "to task log" actions. The Memories button in the viewer lists the Engram
+                rows currently in AiderDesk Memory for this project. The feed is in-memory and resets when AiderDesk
+                restarts; run "/memory:activity" to print it into the task log. This section is global-only.
+              </p>
+              <p className="text-xs text-text-secondary -mt-2">
+                Statements are the facts Engram extracted from your conversations, so they stay out of the viewer
+                until you turn this on. Secrets are redacted before display either way.
+              </p>
+              {activityStatus ? (
+                <p className="text-xs text-text-muted">
+                  Right now: {activityStatus.activity?.size ?? 0} entries (
+                  {activityStatus.activity?.warnings ?? 0} warn, {activityStatus.activity?.errors ?? 0} error)
+                  {activityStatus.busy ? ' - a round is running' : ''}.
+                  {activityStatus.last ? ' Last: ' + activityStatus.last.message : ''}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           <Section title="Secondary LLM" />
 
@@ -413,8 +460,8 @@
       )}
 
       <p className="text-xs text-text-secondary -mt-2">
-        Commands: /memory:extract · /memory:consolidate [force] · /memory:stats · /memory:forget &lt;text&gt; ·
-        /memory:clear-project confirm
+        Commands: /memory:activity [count] · /memory:extract · /memory:consolidate [force] · /memory:stats ·
+        /memory:forget &lt;text&gt; · /memory:clear-project confirm
       </p>
     </div>
   );

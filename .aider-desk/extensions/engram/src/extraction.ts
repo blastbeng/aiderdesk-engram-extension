@@ -59,6 +59,12 @@ import { projectStats, saveState, type EngramState } from './state';
 const TRANSIENT_PHRASE_RE =
   /\b(today|yesterday|tonight|this morning|this afternoon|this evening|right now|just now|at the moment|this session|earlier today)\b/i;
 
+/** One write this round performed — the statement, and what happened to it. */
+export interface MemoryWrite {
+  action: 'stored' | 'updated' | 'obsolete';
+  text: string;
+}
+
 export interface ExtractionReport {
   candidates: number;
   stored: number;
@@ -67,6 +73,11 @@ export interface ExtractionReport {
   obsolete: number;
   skipped: number;
   failure?: string;
+  /**
+   * The statements this round wrote, newest last. Raw store text: the viewer
+   * sanitizes it, and only shows it when `ui.show_content` is on.
+   */
+  writes: MemoryWrite[];
 }
 
 export interface ExtractionOptions {
@@ -138,6 +149,7 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
     duplicates: 0,
     obsolete: 0,
     skipped: 0,
+    writes: [],
   };
 
   const { context, config, state, statePath, projectDir, taskId } = options;
@@ -329,7 +341,9 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
         report.skipped += 1;
         continue;
       }
-      report.stored += await writeNew(memory, projectDir, taskId, candidate);
+      const wrote = await writeNew(memory, projectDir, taskId, candidate);
+      if (wrote) report.writes.push({ action: 'stored', text: candidate.content });
+      report.stored += wrote;
     }
     finish(report, state, statePath, projectDir);
     return report;
@@ -347,7 +361,9 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
       state.totals.duplicatesSkipped += 1;
       return 0;
     }
-    return writeNew(memory, projectDir, taskId, candidate);
+    const wrote = await writeNew(memory, projectDir, taskId, candidate);
+    if (wrote) report.writes.push({ action: 'stored', text: candidate.content });
+    return wrote;
   };
 
   for (let i = 0; i < candidates.length; i++) {
@@ -407,6 +423,10 @@ export async function runExtraction(options: ExtractionOptions): Promise<Extract
           report.updated += 1;
           state.totals.updated += 1;
           if (verdict.verdict === 'OBSOLETE') report.obsolete += 1;
+          report.writes.push({
+            action: verdict.verdict === 'OBSOLETE' ? 'obsolete' : 'updated',
+            text: statement,
+          });
         } else {
           report.stored += await writeNewChecked(candidate, corpus);
         }

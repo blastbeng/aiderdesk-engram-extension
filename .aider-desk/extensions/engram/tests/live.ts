@@ -325,7 +325,15 @@ async function main(): Promise<void> {
 
   const commands = ext.getCommands(ctxB);
   const names = commands.map((c) => c.name).sort();
-  const expected = ['memory:clear-project', 'memory:consolidate', 'memory:dedup', 'memory:extract', 'memory:forget', 'memory:stats'];
+  const expected = [
+    'memory:activity',
+    'memory:clear-project',
+    'memory:consolidate',
+    'memory:dedup',
+    'memory:extract',
+    'memory:forget',
+    'memory:stats',
+  ];
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     throw new Error(`unexpected command set: ${names.join(', ')}`);
   }

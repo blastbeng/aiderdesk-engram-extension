@@ -19,7 +19,8 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 - **Relevant retrieval only** — ≤ 8 memories injected per prompt, ranked by vector relevance (most relevant first), gated by an importance floor **and** a lexical word-overlap gate against the current prompt, each statement capped at 300 chars; otherwise nothing is injected (zero context pollution).
 - **Secret safety** — 17 redaction rules (API keys, AWS, JWT, Bearer, passwords, private keys, high-entropy blobs) applied **before** anything leaves the process.
 - **Never blocks the agent** — fire-and-forget serialized queues; if the secondary LLM is offline, AiderDesk keeps working normally.
-- **Full UI + commands** — settings panel, `Memory: Extract Now`, `Memory: Consolidate`, `Memory: Dedup`, `Memory: Show Statistics`, `Memory: Forget`, `Memory: Clear Project Memories`.
+- **Activity viewer** — an `Engram activity` badge in the task status bar opens a live, per-task feed of what the extension is doing (retrievals, extraction rounds, consolidation, LLM failures, credential-stripped endpoint), plus a `Memories` view of the rows actually stored in AiderDesk Memory. The optional `ui.show_content` switch also lists **what the secondary LLM wrote and what was injected into the prompt**, always secret-redacted before display.
+- **Full UI + commands** — settings panel, `Memory: Extract Now`, `Memory: Consolidate`, `Memory: Dedup`, `Memory: Show Statistics`, `Memory: Forget`, `Memory: Clear Project Memories`, `Memory: Activity`.
 - **Dual transport** — direct HTTP to any OpenAI-compatible endpoint (default), or AiderDesk's native `TaskContext.generateText`.
 - **Per-agent configuration** — one global config for every AiderDesk agent, plus optional per-agent overrides (different secondary model, different trigger, or memory off for one agent). Untouched fields always inherit the global config.
 - **Zero runtime dependencies** — plain `fetch`; no build step; TypeScript loaded directly by AiderDesk's jiti loader.
@@ -30,8 +31,9 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 .aider-desk/extensions/engram/   ← the extension itself (copy this folder)
 ├── index.ts                     Extension: events, commands, settings UI, queues
 ├── src/                         Pipeline modules (extraction, consolidation, …)
-├── tests/                       Offline acceptance harness (16 scenarios)
+├── tests/                       Offline acceptance harness (20 scenarios)
 ├── ConfigComponent.jsx          Settings panel
+├── EngramActivity.jsx           Activity viewer (badge + feed + memories) rendered in the task
 ├── package.json / tsconfig.json
 └── README.md                    Pointer to this file
 ```
@@ -155,9 +157,12 @@ engram/
 │   ├── privacy.ts         17 secret-redaction rules
 │   ├── json.ts            zod v4 schemas + malformed-JSON recovery
 │   ├── state.ts           Statistics (state.json)
+│   ├── activity.ts        In-memory activity feed (ring buffer, scope, redaction)
+│   ├── cursor.ts          Per-task extraction cursor + content hash
 │   └── logger.ts          Configurable [Memory] … logging
-├── tests/                 Offline harness (16 scenarios, real mock HTTP server)
-└── ConfigComponent.jsx    Settings panel
+├── tests/                 Offline harness (20 scenarios, real mock HTTP server)
+├── ConfigComponent.jsx    Settings panel
+└── EngramActivity.jsx     Activity viewer (status-bar badge → feed + memories)
 ```
 
 ## 3. Build
@@ -176,7 +181,7 @@ ln -s /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules node_modules
 # 2) Typecheck (uses AiderDesk's bundled TypeScript; adjust the path to your install):
 /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 
-# 3) Run the offline test harness (16 scenarios, no real LLM needed):
+# 3) Run the offline test harness (20 scenarios, no real LLM needed):
 node tests/run.mjs
 #    equivalent: ./node_modules/.bin/jiti tests/run.ts
 ```
@@ -227,6 +232,11 @@ Notes:
   },
   "privacy": { "redact_secrets": true },
   "logging": { "enabled": true, "level": "info" },
+  "ui": {
+    "show_activity": true,        // status-bar activity badge + viewer
+    "activity_limit": 200,        // entries kept in memory for the viewer (20..5000)
+    "show_content": false         // also list the memory statements (what was written/injected)
+  },
   "agents": {}                          // per-agent overrides, see below
 }
 ```
@@ -294,8 +304,18 @@ Daily use is automatic — you code, Engram remembers. Manual controls (AiderDes
 | `Memory: Show Statistics` | Per-project stats + totals (LLM calls, failures, stored, updated, duplicates) |
 | `Memory: Forget <text>` | Find and delete a specific memory |
 | `Memory: Clear Project Memories` confirm | Wipe the current project's memories (confirmation required) |
+| `Memory: Activity` | Print the current task's activity feed into the task log |
 
 `[Memory] …` logs: extraction started, candidates found, verdicts (new/duplicate/update), consolidation, LLM failures. No secret ever appears in logs (redaction happens upstream).
+
+### Seeing what the extension is doing
+
+The `Engram activity` badge sits in the task status bar and opens a viewer for the **current task**:
+
+- **Feed** — a live, task-scoped stream: retrievals, extraction rounds (with their verdict counts), consolidation runs, `Memory: Forget`, config changes, and every `[Memory] …` log line, each tagged with a level and a kind. The scope selector widens it to the whole project or every task; `To task log` (and the `Memory: Activity` command) prints exactly what the feed shows.
+- **Memories** — the rows actually present in AiderDesk Memory for this project (plus global ones), newest first, with scope, category, importance and timestamps. This is the answer to "did it really store anything?".
+- **`ui.show_content`** (Settings → Extensions → Engram → **Show memory statements**) additionally lists **the statements themselves**: what each extraction round wrote (`stored:` / `updated:` / `obsolete:` lines) and what each retrieval injected. It is **off by default** because those statements are derived from your conversations. When it is on, every statement is still run through the same 17 secret-redaction rules and length-capped before it reaches the viewer, and the raw value never appears.
+- **Persistence** — the feed is an in-memory ring buffer (`ui.activity_limit`, default 200). It is a live debugging surface, not a log file: restarting AiderDesk starts it empty, and the durable `[Memory] …` log lines still go to AiderDesk's normal logs.
 
 Settings has one **Global** tab and one tab per AiderDesk agent profile: edit Global to change behaviour everywhere, open an agent tab to give a single agent its own secondary LLM, trigger, retrieval limits — or switch memory off for it. Untouched sections inherit Global; *Reset to inherit* removes an override.
 
@@ -328,6 +348,10 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | 14 | Council regression pack | A truncated consolidation keeps the round counter, model-written secrets never land in the store, dedup reports per-project removals |
 | 15 | Command surface | Host-legal command definitions, no throw on a broken task context, guarded destructive clear, unload cancels a running consolidation |
 | 16 | Batch-failure resilience + hash false positives | A failed consolidation batch is skipped (cycle continues, counter kept, failure reported per batch), and pure-hex hashes (SHA-1/SHA-256) are not treated as secrets |
+| 17 | Activity surface | The badge and its data/actions, a task-scoped feed a real extraction lands in, the task-log dump, a command that does not record itself, and a credential-bearing endpoint that reaches the viewer stripped |
+| 18 | Spend tokens only on task turns | Subagent, compaction and conflict-resolution runs never extract or reach the secondary LLM; a real task turn still does |
+| 19 | Consolidation cooldown | A failed backlog over the interval cannot retry an automatic consolidation on every subsequent round |
+| 20 | Statements surface | With `ui.show_content` off the feed and the memories view carry no statements; with it on they name what was written and injected, secrets redacted in the feed, the memories view, the dump and `sanitizeStatements` |
 
 ## 8. Troubleshooting
 
@@ -337,6 +361,8 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | No extraction in logs | Trigger not reached or extraction disabled | Check `extraction.enabled`, `trigger`, set log level `debug` |
 | Memories never injected | Native Memory disabled, nothing relevant, the importance floor — or every hit failed the word-overlap gate | Check Settings → Memory; `Memory: Extract Now`; raise `retrieval.max_memories`, lower `retrieval.min_importance`, or set `retrieval.min_overlap` to 0 to disable the gate |
 | Duplicates persist | Secondary LLM too weak to classify | Raise `max_existing_for_dedup`; run `Memory: Consolidate` |
+| The activity feed and memories view show counts but no statements | `ui.show_content` is off (the default — the statements are derived from your conversations) | Settings → Extensions → Engram → **Show memory statements**; statements are always secret-redacted, so a value you expect to see may appear as `[REDACTED]` |
+| An extraction round's digest is missing from the task-scoped feed | Fixed in 1.5.0: the startup probe cleared the shared feed scope and the digest entry lost its `taskId` | Update to 1.5.0+ |
 | `generateText … returned no text` (aiderdesk transport) | `model_id` missing in Settings → Models | Create the provider/model or switch back to `transport: "http"` |
 | Extraction timeouts | Slow model on 12 GB | Lower `extraction.max_input_tokens` or raise `timeout_ms` |
 | Nothing is written at all | Candidate importance < `min_importance` | Lower `min_importance` to 2, check `debug` logs |

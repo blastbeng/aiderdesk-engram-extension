@@ -85,6 +85,17 @@ export interface ExtractionConfig {
   max_candidates: number;
   /** Max existing memories fetched per candidate for dedup/update/conflict classification. */
   max_existing_for_dedup: number;
+  /**
+   * New user/assistant messages required since the last successful round
+   * before an automatic round runs at all (0 = every round runs).
+   *
+   * `agent_end` fires after every agent turn of a task, so without this a
+   * short follow-up ("ok", "continue") still pays for a full extraction round
+   * over a transcript the secondary model has already read. The cursor in
+   * src/cursor.ts decides WHICH messages a round sees; this decides whether
+   * there is enough of them to be worth a call.
+   */
+  min_new_messages: number;
 }
 
 export interface RetrievalConfig {
@@ -141,6 +152,26 @@ export interface LoggingConfig {
 }
 
 /**
+ * AiderDesk UI surface. Global-only by design (see AGENT_SECTION_NAMES): the
+ * activity badge lives in the task status bar of every task, so there is no
+ * meaningful per-agent variant of it.
+ */
+export interface UiConfig {
+  /** Show the Engram activity badge + viewer in the task status bar. */
+  show_activity: boolean;
+  /** How many activity entries are kept in memory for the viewer (20..5000). */
+  activity_limit: number;
+  /**
+   * Show the memory statements themselves in the activity viewer: what the
+   * secondary LLM injected into the prompt and what it wrote to AiderDesk
+   * Memory. Off by default — these are statements derived from your
+   * conversations, so they stay out of the feed until you ask for them.
+   * Secrets are redacted before display regardless of this switch.
+   */
+  show_content: boolean;
+}
+
+/**
  * Per-agent override block, keyed by AiderDesk AgentProfile.id.
  *
  * Every field is optional and inherits from the global section when unset.
@@ -167,6 +198,8 @@ export interface EngramConfig {
   consolidation: ConsolidationConfig;
   privacy: PrivacyConfig;
   logging: LoggingConfig;
+  /** AiderDesk UI surface (global-only). */
+  ui: UiConfig;
   /**
    * Per-agent overrides keyed by AiderDesk agent profile id
    * (e.g. "local", "intesa", ...). Empty object = global config for all agents.
@@ -203,6 +236,7 @@ export const DEFAULT_CONFIG: EngramConfig = {
     max_input_tokens: 12000,
     max_candidates: 20,
     max_existing_for_dedup: 12,
+    min_new_messages: 3,
   },
   retrieval: {
     enabled: true,
@@ -222,6 +256,11 @@ export const DEFAULT_CONFIG: EngramConfig = {
   logging: {
     enabled: true,
     level: 'info',
+  },
+  ui: {
+    show_activity: true,
+    activity_limit: 200,
+    show_content: false,
   },
   agents: {},
 };
@@ -262,6 +301,7 @@ const SECTION_KEYS = {
     max_input_tokens: isNumber,
     max_candidates: isNumber,
     max_existing_for_dedup: isNumber,
+    min_new_messages: isNumber,
   },
   retrieval: {
     enabled: isBoolean,
@@ -282,10 +322,30 @@ const SECTION_KEYS = {
     enabled: isBoolean,
     level: isLogLevel,
   },
+  ui: {
+    show_activity: isBoolean,
+    activity_limit: isNumber,
+    show_content: isBoolean,
+  },
 } as const;
 
 type SectionName = keyof typeof SECTION_KEYS;
+/** Every section the global config accepts. */
 const SECTION_NAMES = Object.keys(SECTION_KEYS) as SectionName[];
+
+/**
+ * The subset a per-agent override may set. `ui` is deliberately absent: the
+ * activity badge is one surface for the whole app, so a per-agent copy of that
+ * switch would be meaningless.
+ */
+const AGENT_SECTION_NAMES: SectionName[] = [
+  'secondary_llm',
+  'extraction',
+  'retrieval',
+  'consolidation',
+  'privacy',
+  'logging',
+];
 
 /** Copy every field from `src` that passes its validator onto `target`. */
 function applySection(target: Record<string, unknown>, src: Record<string, unknown>, key: SectionName): void {
@@ -300,7 +360,7 @@ function mergeAgentOverride(raw: unknown): AgentOverrides | null {
   if (!isPlainObject(raw)) return null;
   const ov: Record<string, unknown> = {};
   if (typeof raw.enabled === 'boolean') ov.enabled = raw.enabled;
-  for (const section of SECTION_NAMES) {
+  for (const section of AGENT_SECTION_NAMES) {
     const src = raw[section];
     if (!isPlainObject(src)) continue;
     const target: Record<string, unknown> = {};
@@ -358,8 +418,10 @@ export function resolveConfig(config: EngramConfig, agentId?: string | null): En
 
   const out: EngramConfig = structuredClone(config);
   if (typeof override.enabled === 'boolean') out.enabled = override.enabled;
-  for (const section of SECTION_NAMES) {
-    const src = override[section];
+  // AGENT_SECTION_NAMES never contains 'ui' (see its definition), so the
+  // index is safe; the cast only tells TypeScript that.
+  for (const section of AGENT_SECTION_NAMES) {
+    const src = (override as Record<string, unknown>)[section];
     if (isPlainObject(src)) {
       Object.assign(out[section] as unknown as Record<string, unknown>, src);
     }
