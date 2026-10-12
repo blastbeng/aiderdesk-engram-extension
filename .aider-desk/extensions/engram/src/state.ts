@@ -14,6 +14,12 @@ export interface ProjectStats {
   obsolete: number;
   lastExtractionAt?: number;
   lastConsolidationAt?: number;
+  /**
+   * Consecutive automatic consolidation runs that rewrote nothing. Persisted
+   * (not in-memory like the cooldown anchor) so an extension reload cannot
+   * reset the backoff of a store that is stuck above the batch cap.
+   */
+  consolidationStalls?: number;
 }
 
 export interface EngramState {
@@ -56,6 +62,7 @@ export function loadState(path: string): EngramState {
           obsolete: Number(value.obsolete) || 0,
           lastExtractionAt: Number(value.lastExtractionAt) || undefined,
           lastConsolidationAt: Number(value.lastConsolidationAt) || undefined,
+          consolidationStalls: Number(value.consolidationStalls) || 0,
         };
       }
     }
@@ -95,6 +102,7 @@ export function projectStats(state: EngramState, projectDir: string): ProjectSta
       deleted: 0,
       duplicates: 0,
       obsolete: 0,
+      consolidationStalls: 0,
     };
   }
   return state.projects[key];

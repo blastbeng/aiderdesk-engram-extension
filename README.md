@@ -31,7 +31,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 .aider-desk/extensions/engram/   ← the extension itself (copy this folder)
 ├── index.ts                     Extension: events, commands, settings UI, queues
 ├── src/                         Pipeline modules (extraction, consolidation, …)
-├── tests/                       Offline acceptance harness (20 scenarios)
+├── tests/                       Offline acceptance harness (22 scenarios)
 ├── ConfigComponent.jsx          Settings panel
 ├── EngramActivity.jsx           Activity viewer (badge + feed + memories) rendered in the task
 ├── package.json / tsconfig.json
@@ -160,7 +160,7 @@ engram/
 │   ├── activity.ts        In-memory activity feed (ring buffer, scope, redaction)
 │   ├── cursor.ts          Per-task extraction cursor + content hash
 │   └── logger.ts          Configurable [Memory] … logging
-├── tests/                 Offline harness (20 scenarios, real mock HTTP server)
+├── tests/                 Offline harness (22 scenarios, real mock HTTP server)
 ├── ConfigComponent.jsx    Settings panel
 └── EngramActivity.jsx     Activity viewer (status-bar badge → feed + memories)
 ```
@@ -181,7 +181,7 @@ ln -s /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules node_modules
 # 2) Typecheck (uses AiderDesk's bundled TypeScript; adjust the path to your install):
 /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 
-# 3) Run the offline test harness (20 scenarios, no real LLM needed):
+# 3) Run the offline test harness (22 scenarios, no real LLM needed):
 node tests/run.mjs
 #    equivalent: ./node_modules/.bin/jiti tests/run.ts
 ```
@@ -352,6 +352,8 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | 18 | Spend tokens only on task turns | Subagent, compaction and conflict-resolution runs never extract or reach the secondary LLM; a real task turn still does |
 | 19 | Consolidation cooldown | A failed backlog over the interval cannot retry an automatic consolidation on every subsequent round |
 | 20 | Statements surface | With `ui.show_content` off the feed and the memories view carry no statements; with it on they name what was written and injected, secrets redacted in the feed, the memories view, the dump and `sanitizeStatements` |
+| 21 | Consolidation backoff | A project with 4 no-progress runs behind it must not consolidate again at 11 minutes (window is 10 min × 2⁴), while the same 11-minute-old attempt with no streak still does — the flat 10-minute cooldown re-ran it every time |
+| 22 | Stall streak persistence | A run that rewrote nothing (every batch failed) persists the stall streak in `state.json`, and a later productive manual run clears it |
 
 ## 8. Troubleshooting
 
@@ -361,6 +363,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | No extraction in logs | Trigger not reached or extraction disabled | Check `extraction.enabled`, `trigger`, set log level `debug` |
 | Memories never injected | Native Memory disabled, nothing relevant, the importance floor — or every hit failed the word-overlap gate | Check Settings → Memory; `Memory: Extract Now`; raise `retrieval.max_memories`, lower `retrieval.min_importance`, or set `retrieval.min_overlap` to 0 to disable the gate |
 | Duplicates persist | Secondary LLM too weak to classify | Raise `max_existing_for_dedup`; run `Memory: Consolidate` |
+| The secondary LLM is called every ~10 minutes even though consolidation keeps merging nothing | The store is larger than the batch cap, so the round counter stays above the interval and a flat cooldown re-ran the same window forever | Fixed in 1.5.1: every no-progress run doubles the automatic cooldown (10 min → 6 h ceiling), and any run that rewrites something resets it. `Memory: Show Statistics` prints the current window and the no-progress streak |
 | The activity feed and memories view show counts but no statements | `ui.show_content` is off (the default — the statements are derived from your conversations) | Settings → Extensions → Engram → **Show memory statements**; statements are always secret-redacted, so a value you expect to see may appear as `[REDACTED]` |
 | An extraction round's digest is missing from the task-scoped feed | Fixed in 1.5.0: the startup probe cleared the shared feed scope and the digest entry lost its `taskId` | Update to 1.5.0+ |
 | `generateText … returned no text` (aiderdesk transport) | `model_id` missing in Settings → Models | Create the provider/model or switch back to `transport: "http"` |
@@ -375,7 +378,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 - **Footer inside `content`**: a direct consequence of the missing metadata column in the 0.81.0 Memory API. Memories created outside Engram are neither read nor modified by consolidation.
 - **No per-call relevance threshold**: `retrieveMemories` returns no score or distance, and AiderDesk's global `memory.maxDistance` (default 1.5 on the 0–2 cosine scale) is permissive — the effective client-side gates are `retrieval.min_importance` and the lexical word-overlap gate `retrieval.min_overlap`.
 - **Injection via `onImportantReminders`**: the block arrives with the reminders (in the user message, inside `<ThisIsImportant>`), not in the system prompt — the 0.81.0 API offers no alternative.
-- **Consolidation in batches**: ~4,500-token budget per batch, oldest memories first; a failed batch is skipped and reported while the cycle continues with the next; beyond budget, remaining batches run on the next cycle.
+- **Consolidation in batches**: ~4,500-token budget per batch, oldest memories first; a failed batch is skipped and reported while the cycle continues with the next; beyond budget, remaining batches run on the next cycle. A run that rewrites nothing both keeps the round counter *and* widens the automatic cooldown (10 min × 2ⁿ, capped at 6 h), because re-sending the same window minutes later buys nothing; a manual `Memory: Consolidate` is never throttled.
 - **`prompt_end` as trigger**: fires often, so it costs more secondary-LLM calls; `agent_end` is recommended.
 - **Per-agent overrides need a resolvable agent id**: the id comes from the event payload or `TaskContext.getTaskAgentProfile()`. When neither is available (rare, e.g. a command invoked without a task context) the global config is used — memory degrades to global, never to nothing. The settings tab list comes from the live API when available and from the agent profile files on disk otherwise (see "How the tab list is discovered" above) — including when the dialog is opened from the global Settings > Extensions page, which has no project context.
 

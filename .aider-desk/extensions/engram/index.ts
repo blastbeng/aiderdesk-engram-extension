@@ -39,9 +39,9 @@ import { listAgentProfiles, type AgentMeta } from './src/agents';
 import { activity, safeEndpoint, sanitizeStatements, type ActivityEntry, type ActivityLevel, type ActivityScope } from './src/activity';
 import { ExtractionCursors, countInformative, hashMessages } from './src/cursor';
 import { logger } from './src/logger';
-import { loadState, saveState, projectStats, type EngramState } from './src/state';
+import { loadState, saveState, projectStats, type EngramState, type ProjectStats } from './src/state';
 import { runExtraction } from './src/extraction';
-import { runConsolidation } from './src/consolidation';
+import { runConsolidation, type ConsolidationReport } from './src/consolidation';
 import { retrieveForPrompt, stripBlock, wrapBlock } from './src/retrieval';
 import {
   deterministicDedup,
@@ -104,6 +104,32 @@ const INTERNAL_AGENT_MODES = new Set(['subagent', 'compact-conversation', 'confl
  * capping how often it can cost anything.
  */
 const CONSOLIDATION_COOLDOWN_MS = 10 * 60 * 1000;
+
+/**
+ * Ceiling for the growing automatic-consolidation cooldown. The cooldown
+ * doubles once per no-progress run (recordConsolidationProgress), so a store
+ * stuck above MAX_BATCHES stops costing a batch of calls every 10 minutes and
+ * settles at a few runs per day instead.
+ */
+const CONSOLIDATION_MAX_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Deepest stall streak that still widens the cooldown. 10 doublings of the
+ * 10-minute base is already past CONSOLIDATION_MAX_COOLDOWN_MS; the cap only
+ * keeps `2 ** stalls` finite against a hand-edited state.json.
+ */
+const CONSOLIDATION_STALL_CAP = 10;
+
+/** The persisted no-progress streak for a project, clamped to a sane range. */
+function stallRuns(stats: ProjectStats): number {
+  return Math.min(CONSOLIDATION_STALL_CAP, Math.max(0, Math.floor(stats.consolidationStalls ?? 0)));
+}
+
+/** Automatic-consolidation cooldown for a streak of no-progress runs. */
+function consolidationCooldown(stalls: number): number {
+  const capped = Math.min(CONSOLIDATION_STALL_CAP, Math.max(0, Math.floor(stalls)));
+  return Math.min(CONSOLIDATION_MAX_COOLDOWN_MS, CONSOLIDATION_COOLDOWN_MS * 2 ** capped);
+}
 
 /**
  * Consecutive automatic-round failures that trip the per-project circuit breaker.
@@ -251,9 +277,11 @@ export interface EngramActivityStatus {
   /**
    * Token-gating state, so the viewer can show WHY nothing is happening:
    * `cursorTasks` is how many tasks have a live extraction position, `paused`
-   * is the circuit breaker holding automatic rounds off a failing endpoint.
+   * is the circuit breaker holding automatic rounds off a failing endpoint,
+   * `consolidationStalls` is how far automatic consolidation has backed off
+   * after runs that rewrote nothing.
    */
-  gating: { cursorTasks: number; paused: boolean };
+  gating: { cursorTasks: number; paused: boolean; consolidationStalls: number };
   project: {
     dir: string;
     counts: {
@@ -273,7 +301,7 @@ export interface EngramActivityStatus {
 export default class EngramMemoryExtension implements Extension {
   static metadata = {
     name: 'Engram Memory',
-    version: '1.5.0',
+    version: '1.5.1',
     description:
       'Automatic long-term memory: extracts durable facts from conversations with a secondary local OpenAI-compatible LLM, dedupes/updates/resolves conflicts in AiderDesk Memory, consolidates periodically, injects only relevant memories, and shows what it is doing in a per-task activity viewer.',
     author: 'local',
@@ -772,10 +800,19 @@ export default class EngramMemoryExtension implements Extension {
 
     // Rate-limit automatic runs (see CONSOLIDATION_COOLDOWN_MS). A manual
     // /memory:consolidate is a different code path and is never throttled.
+    // The window grows per no-progress run (recordConsolidationProgress): a
+    // store stuck above the batch cap keeps the round counter above the
+    // interval on purpose (src/consolidation.ts), so a flat 10-minute cooldown
+    // alone means a fresh batch of LLM calls every 10 minutes, forever.
     const now = Date.now();
     const anchor = Math.max(stats.lastConsolidationAt ?? 0, this.lastAutoConsolidate.get(projectDir) ?? 0);
-    if (now - anchor < CONSOLIDATION_COOLDOWN_MS) {
-      logger.debug('consolidation skipped - cooldown after the previous run');
+    const stalls = stallRuns(stats);
+    const cooldown = consolidationCooldown(stalls);
+    if (now - anchor < cooldown) {
+      logger.debug(
+        'consolidation skipped - cooldown after the previous run' +
+          (stalls > 0 ? ` (${stalls} no-progress run(s), window ${Math.round(cooldown / 60000)} min)` : ''),
+      );
       return;
     }
     // Consolidation is the most expensive thing this extension does - many
@@ -828,6 +865,7 @@ export default class EngramMemoryExtension implements Extension {
             },
           });
         }
+        this.recordConsolidationProgress(projectDir, report);
       } catch (error) {
         logger.warn(`consolidation error: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
@@ -836,6 +874,40 @@ export default class EngramMemoryExtension implements Extension {
         this.refreshActivityUI(context, taskId);
       }
     });
+  }
+
+  /**
+   * Track whether an automatic consolidation run actually rewrote anything, so
+   * `maybeConsolidate` can widen its cooldown instead of re-running the same
+   * window every 10 minutes.
+   *
+   * A run is counted as a stall only when it rewrote nothing AND left work
+   * undone (a failed batch, or batches deferred past MAX_BATCHES). A clean run
+   * that found nothing to merge is not a stall - it resets the round counter in
+   * src/consolidation.ts, so backing off would only starve a healthy store.
+   * The streak is persisted because the in-memory cooldown anchor is not: an
+   * extension reload must not reset the backoff of a stuck store.
+   */
+  private recordConsolidationProgress(projectDir: string, report: ConsolidationReport): void {
+    const stats = projectStats(this.state, projectDir);
+    const rewrite = report.merged + report.updated + report.deleted;
+    const unfinished = (report.failedBatches ?? 0) + (report.deferredBatches ?? 0);
+    if (report.aborted || rewrite > 0 || unfinished === 0) {
+      if (stallRuns(stats) > 0) {
+        logger.debug(`consolidation made progress (${rewrite} rewrite(s)) - stall backoff reset`);
+      }
+      stats.consolidationStalls = 0;
+    } else {
+      stats.consolidationStalls = stallRuns(stats) + 1;
+      const why = report.failedBatches
+        ? `${report.failedBatches} batch(es) failed`
+        : `${report.deferredBatches} batch(es) beyond the cap`;
+      logger.warn(
+        `consolidation made no progress (${why}); automatic rounds backed off to ` +
+          `${Math.round(consolidationCooldown(stats.consolidationStalls) / 60000)} min`,
+      );
+    }
+    saveState(this.statePath, this.state);
   }
 
   private countRound(projectDir: string): void {
@@ -926,6 +998,9 @@ export default class EngramMemoryExtension implements Extension {
               signal: this.abortController.signal,
               taskContext: ctx.getTaskContext(),
             });
+            // A manual run is never throttled, and a successful one is proof
+            // the endpoint is healthy again - clear any automatic backoff.
+            this.recordConsolidationProgress(projectDir, report);
             const line = report.failure
               ? `consolidation failed: ${report.failure}`
               : `consolidated ${report.scanned} memories -> merged ${report.merged}, updated ${report.updated}, deleted ${report.deleted}, kept ${report.kept}`;
@@ -1005,7 +1080,7 @@ export default class EngramMemoryExtension implements Extension {
             `[Memory] totals: LLM calls ${this.state.totals.llmCalls} (failures ${this.state.totals.llmFailures}), stored ${this.state.totals.stored}, updated ${this.state.totals.updated}, deleted ${this.state.totals.deleted}`,
             `[Memory] extraction: enabled=${cfg.extraction.enabled} trigger=${cfg.extraction.trigger} min_importance=${cfg.extraction.min_importance}`,
             `[Memory] retrieval: enabled=${cfg.retrieval.enabled} max_memories=${cfg.retrieval.max_memories} min_importance=${cfg.retrieval.min_importance} min_overlap=${cfg.retrieval.min_overlap}`,
-            `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${cfg.consolidation.interval_tasks} rounds, safe_mode=${cfg.consolidation.safe_mode}`,
+            `[Memory] consolidation: ${stats.tasksSinceConsolidation}/${cfg.consolidation.interval_tasks} rounds, safe_mode=${cfg.consolidation.safe_mode}, cooldown=${Math.round(consolidationCooldown(stallRuns(stats)) / 60000)} min (${stallRuns(stats)} no-progress run(s))`,
             `[Memory] secondary LLM: ${cfg.secondary_llm.model} @ ${cfg.secondary_llm.base_url}`,
           ];
           for (const line of lines) say(ctx, 'info', line);
@@ -1189,7 +1264,7 @@ export default class EngramMemoryExtension implements Extension {
           logger.setConfig(effective.logging);
           activity.setScope({ kind: 'consolidation', projectDir, taskId, agentId });
           try {
-            await runConsolidation({
+            const report = await runConsolidation({
               context,
               projectDir,
               config: {
@@ -1201,6 +1276,9 @@ export default class EngramMemoryExtension implements Extension {
               signal: this.abortController.signal,
               taskContext: context.getTaskContext(),
             });
+            // Same as the /memory:consolidate command: a manual, unthrottled
+            // run that made progress clears the automatic backoff.
+            this.recordConsolidationProgress(projectDir, report);
           } catch (error) {
             logger.warn(`consolidation error: ${error instanceof Error ? error.message : String(error)}`);
           } finally {
@@ -1308,7 +1386,11 @@ export default class EngramMemoryExtension implements Extension {
         endpoint: safeEndpoint(cfg.secondary_llm.base_url),
       },
       logging: { enabled: cfg.logging.enabled, level: cfg.logging.level },
-      gating: { cursorTasks: this.cursors.size(), paused: this.breakerPaused(projectDir) },
+      gating: {
+        cursorTasks: this.cursors.size(),
+        paused: this.breakerPaused(projectDir),
+        consolidationStalls: stallRuns(projectStats(this.state, projectDir)),
+      },
       activity: {
         show: cfg.ui.show_activity,
         limit: activity.getLimit(),

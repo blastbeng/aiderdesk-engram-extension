@@ -36,6 +36,19 @@ export interface ConsolidationReport {
   failedBatches?: number;
   /** One short, log-safe failure summary per failed batch. */
   batchFailures?: string[];
+  /**
+   * Batches beyond MAX_BATCHES that this run never sent to the LLM (0 when the
+   * whole store fitted). The caller needs this to tell "made no progress on a
+   * backlog" from "made no progress because there was nothing left to do":
+   * only the former re-triggers, and only the former may back off.
+   */
+  deferredBatches?: number;
+  /**
+   * True when the run was cancelled mid-flight (extension unload). An abort is
+   * not the store's fault, so the caller must not read "no progress" off it and
+   * back automatic rounds away.
+   */
+  aborted?: boolean;
   failure?: string;
 }
 
@@ -111,6 +124,7 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
   // True when the store is too large for one run: batches beyond the cap are
   // never sent to the LLM this round.
   const truncated = batches.length > MAX_BATCHES;
+  report.deferredBatches = batches.length - windowSize;
   logger.info(`consolidating ${targets.length} memories in ${windowSize} batch(es)...`);
 
   // A run that is cancelled mid-flight (extension unload) must be
@@ -180,6 +194,7 @@ export async function runConsolidation(options: ConsolidationOptions): Promise<C
     await applyActions(parsed.data.actions, table, byId, memory, projectDir, report, config, state);
   }
 
+  report.aborted = abortedDuringRun;
   const failedBatches = batchFailures.length;
   if (failedBatches > 0) {
     report.failedBatches = failedBatches;

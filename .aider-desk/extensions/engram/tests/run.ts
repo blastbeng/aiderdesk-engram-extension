@@ -53,6 +53,12 @@
  * Memory, and what is it reading back out" surface: statements are absent from
  * the feed and from the memories view while `ui.show_content` is off, appear
  * once it is on, and reach the viewer secret-redacted in both cases.
+ * Scenario 21 covers the automatic-consolidation backoff: a project with
+ * several no-progress runs behind it must not consolidate again inside the
+ * grown cooldown (the flat 10 minutes re-ran it every time), while the same
+ * 11-minute-old attempt without a streak still does. Scenario 22 covers how
+ * that streak is recorded: a run that rewrote nothing persists a stall, and a
+ * later productive manual run clears it.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -2213,6 +2219,204 @@ async function scenario14(): Promise<void> {
         check(cleaned.every((line) => line.includes('  ') === false), 'statements must be whitespace-collapsed');
         check(cleaned[0].includes('hunter2keep') === false, 'a password assignment must be redacted');
 
+        await ext.onUnload();
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 21
+  await scenario(
+    '21. A no-progress backlog grows the consolidation cooldown instead of re-running every 10 minutes',
+    async () => {
+      const h = await makeHarness(scriptedResponder());
+      const dir = mkdtempSync(join(tmpdir(), 'engram-backoff-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+
+      // interval_tasks 2 => threshold 2, so the seeded counter is already over.
+      writeFileSync(
+        configPath,
+        JSON.stringify({ ...h.config, consolidation: { enabled: true, interval_tasks: 2, safe_mode: true } }, null, 2),
+        'utf-8',
+      );
+      EngramMemoryExtension.testPaths = { configPath, statePath };
+
+      const isConsolidationCall = (req: { messages?: { role: string; content: string }[] }): boolean =>
+        /consolidat/i.test(systemOf(req));
+
+      const seedMemories = (): void => {
+        for (let i = 0; i < 2; i++) {
+          h.memory.seed(
+            randomUUID(),
+            h.projectDir,
+            'code-pattern',
+            encodeForHarness(`The staging cluster ${i} keeps its docker images for an hour.`, {
+              category: 'configuration',
+              importance: 4,
+              scope: 'project',
+              confidence: 0.9,
+            }),
+          );
+        }
+      };
+
+      const build = async (
+        taskId: string,
+      ): Promise<{ ext: EngramMemoryExtension; ctx: ReturnType<typeof mockExtensionContext> }> => {
+        const ext = new EngramMemoryExtension();
+        const ctx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: taskId,
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await ext.onLoad(ctx);
+        return { ext, ctx };
+      };
+
+      const finished = (): AgentFinishedEvent =>
+        ({ mode: 'agent', aborted: false, contextMessages: LLAMA_CONVERSATION(), resultMessages: [] }) as AgentFinishedEvent;
+
+      const seedBacklog = (stalls: number): void => {
+        const state = loadState(statePath);
+        const stats = projectStats(state, h.projectDir);
+        stats.tasksSinceConsolidation = 5;
+        stats.consolidationStalls = stalls;
+        // 11 minutes old: past the flat 10-minute base, inside any grown window.
+        stats.lastConsolidationAt = Date.now() - 11 * 60 * 1000;
+        saveState(statePath, state);
+      };
+
+      try {
+        seedMemories();
+
+        // ---- A. Four no-progress runs behind it: the window is 10 * 2^4 = 160
+        // min, so the 11-minute-old attempt must NOT run. The old flat cooldown
+        // consolidated right here - that is the token-wasting retry storm.
+        seedBacklog(4);
+        const stalled = await build('task-backoff-stalled');
+        await stalled.ext.onAgentFinished(finished(), stalled.ctx);
+        await stalled.ext.drainQueues();
+        check(
+          h.server.requests.filter(isConsolidationCall).length === 0,
+          'a project with 4 no-progress runs and an 11-minute-old attempt must not consolidate again',
+        );
+        const stalledStatus = (await stalled.ext.getUIExtensionData('engram-activity', stalled.ctx)) as {
+          gating: { consolidationStalls: number };
+        };
+        check(
+          stalledStatus.gating.consolidationStalls === 4,
+          `the viewer must report the 4-run stall streak, got ${stalledStatus.gating.consolidationStalls}`,
+        );
+        await stalled.ext.onUnload();
+
+        // ---- B. Control: same age, no stall streak. This must consolidate, or
+        // A would pass for the wrong reason (nothing ever consolidating).
+        seedBacklog(0);
+        const fresh = await build('task-backoff-fresh');
+        await fresh.ext.onAgentFinished(finished(), fresh.ctx);
+        await fresh.ext.drainQueues();
+        check(
+          h.server.requests.filter(isConsolidationCall).length >= 1,
+          'without a stall streak the same 11-minute-old attempt must consolidate (control)',
+        );
+        await fresh.ext.onUnload();
+      } finally {
+        EngramMemoryExtension.testPaths = null;
+        rmSync(dir, { recursive: true, force: true });
+        await h.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 22
+  await scenario(
+    '22. A no-progress automatic run persists the stall streak, and a productive manual run clears it',
+    async () => {
+      // Consolidation answers 503 while the endpoint is "down", so a run
+      // reviews nothing; once "up" the same two near-identical memories merge.
+      let down = true;
+      const outages: Responder = (body) => {
+        if (/consolidat/i.test(systemOf(body))) {
+          return down ? { status: 503, message: 'mock consolidation outage' } : scriptedResponder()(body);
+        }
+        return scriptedResponder()(body);
+      };
+      const h = await makeHarness(outages);
+      const dir = mkdtempSync(join(tmpdir(), 'engram-stall-'));
+      const configPath = join(dir, 'config.json');
+      const statePath = join(dir, 'state.json');
+      const logMessages: string[] = [];
+
+      writeFileSync(
+        configPath,
+        JSON.stringify({ ...h.config, consolidation: { enabled: true, interval_tasks: 2, safe_mode: true } }, null, 2),
+        'utf-8',
+      );
+      EngramMemoryExtension.testPaths = { configPath, statePath };
+
+      try {
+        for (let i = 0; i < 2; i++) {
+          h.memory.seed(
+            randomUUID(),
+            h.projectDir,
+            'code-pattern',
+            encodeForHarness(`The release pipeline ${i} tags every build with a git sha.`, {
+              category: 'configuration',
+              importance: 4,
+              scope: 'project',
+              confidence: 0.9,
+            }),
+          );
+        }
+        const seeded = loadState(statePath);
+        projectStats(seeded, h.projectDir).tasksSinceConsolidation = 5;
+        saveState(statePath, seeded);
+
+        const ext = new EngramMemoryExtension();
+        const ctx = mockExtensionContext(h.memory, h.projectDir, {
+          sink: createLogSink(),
+          agentProfiles: [{ id: 'local' }],
+          taskContext: mockTaskContext({
+            id: 'task-stall',
+            agentProfile: { id: 'local' },
+            logMessages,
+            contextMessages: LLAMA_CONVERSATION(),
+          }),
+        });
+        await ext.onLoad(ctx);
+        const finished = (): AgentFinishedEvent =>
+          ({ mode: 'agent', aborted: false, contextMessages: LLAMA_CONVERSATION(), resultMessages: [] }) as AgentFinishedEvent;
+
+        // ---- A. The automatic round rewrote nothing (every batch failed), so
+        // the streak must be persisted - not just held in memory, which an
+        // extension reload would drop.
+        await ext.onAgentFinished(finished(), ctx);
+        await ext.drainQueues();
+        check(
+          projectStats(loadState(statePath), h.projectDir).consolidationStalls === 1,
+          'a no-progress automatic run must persist a stall streak of 1',
+        );
+
+        // ---- B. The endpoint recovers; a manual run is never throttled and
+        // merges the duplicates, so it must clear the streak for the next
+        // automatic round instead of leaving it armed.
+        down = false;
+        await ext.getCommands(ctx).find((c) => c.name === 'memory:consolidate')!.execute([], ctx);
+        await ext.drainQueues();
+        check(
+          projectStats(loadState(statePath), h.projectDir).consolidationStalls === 0,
+          'a manual run that merged memories must clear the stall streak',
+        );
         await ext.onUnload();
       } finally {
         EngramMemoryExtension.testPaths = null;
