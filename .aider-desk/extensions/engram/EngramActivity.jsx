@@ -188,7 +188,7 @@
 
       {open && ModalOverlayLayout ? (
         <ModalOverlayLayout title="Engram activity" onClose={() => setOpen(false)}>
-          <div className="flex flex-col gap-3 min-w-[520px] max-w-[720px]">
+          <div className="flex flex-1 min-h-0 w-full max-w-[720px] mx-auto flex-col gap-3 overflow-y-auto p-3">
             <div className="flex flex-col gap-1.5">
               <div className="flex items-center gap-3 flex-wrap text-xs text-text-secondary">
                 <span className="flex items-center gap-1.5">
@@ -317,7 +317,7 @@
                     Reload
                   </Button>
                 </div>
-                <div className="flex flex-col rounded-md border border-border overflow-y-auto max-h-[46vh]">
+                <div className="flex flex-col rounded-md border border-border">
                   {!memories || !memories.items || memories.items.length === 0 ? (
                     <p className="text-xs text-text-muted px-2 py-6 text-center">
                       No Engram memories for this project yet. Extraction writes them at the end of an agent turn.
@@ -346,7 +346,7 @@
                 </div>
               </div>
             ) : (
-              <div className="flex flex-col rounded-md border border-border overflow-y-auto max-h-[46vh]">
+              <div className="flex flex-col rounded-md border border-border">
               {entries.length === 0 ? (
                 <p className="text-xs text-text-muted px-2 py-6 text-center">
                   Nothing recorded for this scope yet. Activity appears as retrieval, extraction and consolidation run.

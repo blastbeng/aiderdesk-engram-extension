@@ -301,7 +301,7 @@ export interface EngramActivityStatus {
 export default class EngramMemoryExtension implements Extension {
   static metadata = {
     name: 'Engram Memory',
-    version: '1.5.1',
+    version: '1.5.2',
     description:
       'Automatic long-term memory: extracts durable facts from conversations with a secondary local OpenAI-compatible LLM, dedupes/updates/resolves conflicts in AiderDesk Memory, consolidates periodically, injects only relevant memories, and shows what it is doing in a per-task activity viewer.',
     author: 'local',
