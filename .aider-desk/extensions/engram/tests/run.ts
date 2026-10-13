@@ -59,6 +59,12 @@
  * 11-minute-old attempt without a streak still does. Scenario 22 covers how
  * that streak is recorded: a run that rewrote nothing persists a stall, and a
  * later productive manual run clears it.
+ * Scenario 23 covers the two-install case (global + project-local): the local
+ * copy owns its project, the global copy registers no badge, no commands and no
+ * extraction there, answers the id-resolved UI and settings calls FOR the owner
+ * (AiderDesk resolves them by extension id, which both copies share), keeps
+ * serving every other project, and takes the project back when the local
+ * install is unloaded.
  * Exit code 0 = every assertion passed.
  *
  * Run (from the extension directory):
@@ -81,6 +87,7 @@ import type {
 import { aliasFor, buildAliasTable, resolveAlias } from '../src/aliases';
 import { safeEndpoint, sanitizeStatements, type ActivityEntry } from '../src/activity';
 import { hasAgentOverride, mergeConfig, resolveConfig, type EngramConfig } from '../src/config';
+import { scopeOfInstall } from '../src/instance';
 import { logger } from '../src/logger';
 import { runExtraction, type ExtractionReport } from '../src/extraction';
 import { runConsolidation } from '../src/consolidation';
@@ -2421,6 +2428,155 @@ async function scenario14(): Promise<void> {
       } finally {
         EngramMemoryExtension.testPaths = null;
         rmSync(dir, { recursive: true, force: true });
+        await h.close();
+      }
+    },
+  );
+
+  // ------------------------------------------------------------- scenario 23
+  await scenario(
+    '23. Global + project-local install: the local copy owns its project, the global copy is idle there and answers for it',
+    async () => {
+      const h = await makeHarness(scriptedResponder());
+      // Two installs of the same extension, in the layout AiderDesk scans.
+      const home = mkdtempSync(join(tmpdir(), 'engram-home-'));
+      const localProject = mkdtempSync(join(tmpdir(), 'engram-local-'));
+      const otherProject = mkdtempSync(join(tmpdir(), 'engram-other-'));
+      const globalDir = join(home, 'extensions', 'engram');
+      const localDir = join(localProject, '.aider-desk', 'extensions', 'engram');
+      const globalRun = mkdtempSync(join(tmpdir(), 'engram-gcfg-'));
+      const localRun = mkdtempSync(join(tmpdir(), 'engram-lcfg-'));
+
+      // Each copy reads its own config.json, so a status payload identifies
+      // which copy produced it - that is how the delegation is asserted.
+      const writeConfig = (base: string, model: string): string => {
+        const path = join(base, 'config.json');
+        writeFileSync(
+          path,
+          JSON.stringify(mergeConfig({ ...h.config, secondary_llm: { ...h.config.secondary_llm, model } }), null, 2),
+          'utf-8',
+        );
+        return path;
+      };
+      const globalConfig = writeConfig(globalRun, 'global-model');
+      const localConfig = writeConfig(localRun, 'local-model');
+
+      const prevHome = process.env.AIDER_DESK_HOME_DIR;
+      process.env.AIDER_DESK_HOME_DIR = home;
+
+      try {
+        // ---- A. Scope comes from the install path, the only fact a copy has
+        // about where it lives.
+        check(scopeOfInstall(globalDir) === null, 'a copy under the home extensions dir must be a global install');
+        check(
+          scopeOfInstall(localDir) === localProject,
+          'a copy under <project>/.aider-desk/extensions must be a project-local install',
+        );
+
+        const ctxFor = (projectDir: string) =>
+          mockExtensionContext(h.memory, projectDir, {
+            sink: createLogSink(),
+            agentProfiles: [{ id: 'local' }],
+            taskContext: mockTaskContext({
+              id: 'task-seats',
+              agentProfile: { id: 'local' },
+              contextMessages: LLAMA_CONVERSATION(),
+            }),
+          });
+        const ctxLocal = ctxFor(localProject);
+        const ctxOther = ctxFor(otherProject);
+        const ctxNoProject = ctxFor('');
+
+        EngramMemoryExtension.testPaths = { configPath: globalConfig, statePath: join(globalRun, 'state.json') };
+        EngramMemoryExtension.testInstallDir = globalDir;
+        const globalExt = new EngramMemoryExtension();
+        EngramMemoryExtension.testPaths = { configPath: localConfig, statePath: join(localRun, 'state.json') };
+        EngramMemoryExtension.testInstallDir = localDir;
+        const localExt = new EngramMemoryExtension();
+        EngramMemoryExtension.testPaths = null;
+        EngramMemoryExtension.testInstallDir = null;
+
+        await globalExt.onLoad(ctxNoProject);
+        await localExt.onLoad(ctxLocal);
+
+        // ---- B. The reported bug: two "Engram" badges in one status bar.
+        check(
+          globalExt.getUIComponents(ctxLocal).length === 0,
+          'the global copy must register no badge in a project that has its own install',
+        );
+        check(localExt.getUIComponents(ctxLocal).length === 1, 'the local copy must register the badge for its project');
+
+        // ---- C. One command set, from the copy that owns the project.
+        check(globalExt.getCommands(ctxLocal).length === 0, 'the global copy must register no commands in that project');
+        check(localExt.getCommands(ctxLocal).length > 0, 'the local copy must register the commands');
+
+        // ---- D. No second extraction round for one conversation.
+        const finished = (): AgentFinishedEvent =>
+          ({ mode: 'agent', aborted: false, contextMessages: LLAMA_CONVERSATION(), resultMessages: [] }) as AgentFinishedEvent;
+        await globalExt.onAgentFinished(finished(), ctxLocal);
+        await globalExt.drainQueues();
+        check(h.memory.count() === 0, 'the idle copy must not extract in a project the local install owns');
+
+        // The viewer's "Extract now" reaches the same action through the copy
+        // the host happens to resolve, and must still run on the owner.
+        const started = (await globalExt.executeUIExtensionAction('engram-activity', 'extract', [{}], ctxLocal)) as {
+          started?: boolean;
+        };
+        check(started.started === true, 'the viewer action must be served by the owning copy');
+        await localExt.drainQueues();
+        check(h.memory.count() >= 1, 'the action must have stored a memory through the owning copy');
+
+        // ---- E. AiderDesk resolves the badge by extension id, and both copies
+        // share it (the id is the directory name), and it takes the FIRST copy
+        // that answers. So the copy it picked must answer FOR the owner: the
+        // payload must carry the local copy's model and the local copy's
+        // counters, not the idle copy's own.
+        const viaIdle = (await globalExt.getUIExtensionData('engram-activity', ctxLocal)) as {
+          llm: { model: string };
+          project: { dir: string; counts: { stored: number } };
+        };
+        check(
+          viaIdle.llm.model === 'local-model',
+          `the data call answered by the idle copy must be served by the owner, got model '${viaIdle.llm.model}'`,
+        );
+        check(viaIdle.project.dir === localProject, 'the badge data must describe the local project');
+        check(viaIdle.project.counts.stored >= 1, 'the counters must come from the owning copy');
+
+        // ---- F. Everywhere else the global copy is untouched.
+        check(
+          globalExt.getUIComponents(ctxOther).length === 1,
+          'the global copy must keep its badge in a project without a local install',
+        );
+        check(globalExt.getCommands(ctxOther).length > 0, 'the global copy must keep its commands elsewhere');
+        const otherStatus = (await globalExt.getUIExtensionData('engram-activity', ctxOther)) as {
+          llm: { model: string };
+        };
+        check(otherStatus.llm.model === 'global-model', 'the global copy serves its own config outside the local project');
+
+        // ---- G. The settings panel is resolved by extension id too. Both
+        // copies must render the owner's component and the owner's config, and
+        // the project-less context (the global settings dialog) is the global
+        // copy's.
+        check(typeof localExt.getConfigComponent(ctxLocal) === 'string', 'the settings component must render for the local project');
+        check(typeof globalExt.getConfigComponent(ctxLocal) === 'string', 'the settings component must render from the copy the host picked');
+        const localData = (await globalExt.getConfigData(ctxLocal)) as { secondary_llm: { model: string } };
+        check(localData.secondary_llm.model === 'local-model', 'the settings panel must show the owning copy configuration');
+        const globalData = (await localExt.getConfigData(ctxNoProject)) as { secondary_llm: { model: string } };
+        check(globalData.secondary_llm.model === 'global-model', 'the project-less settings context belongs to the global install');
+
+        // ---- H. Removing the local install hands the project back.
+        await localExt.onUnload();
+        check(
+          globalExt.getUIComponents(ctxLocal).length === 1,
+          'the global copy must take the project back when the local install is unloaded',
+        );
+        check(localExt.getUIComponents(ctxLocal).length === 0, 'an unloaded copy must register nothing');
+      } finally {
+        if (prevHome === undefined) delete process.env.AIDER_DESK_HOME_DIR;
+        else process.env.AIDER_DESK_HOME_DIR = prevHome;
+        for (const path of [home, localProject, otherProject, globalRun, localRun]) {
+          rmSync(path, { recursive: true, force: true });
+        }
         await h.close();
       }
     },

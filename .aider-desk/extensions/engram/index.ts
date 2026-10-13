@@ -56,6 +56,7 @@ import {
 } from './src/store';
 import { decodeMemory } from './src/memory-format';
 import { probe } from './src/llm';
+import { InstanceSeat, type EngramInstanceApi } from './src/instance';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -301,7 +302,7 @@ export interface EngramActivityStatus {
 export default class EngramMemoryExtension implements Extension {
   static metadata = {
     name: 'Engram Memory',
-    version: '1.5.2',
+    version: '1.6.0',
     description:
       'Automatic long-term memory: extracts durable facts from conversations with a secondary local OpenAI-compatible LLM, dedupes/updates/resolves conflicts in AiderDesk Memory, consolidates periodically, injects only relevant memories, and shows what it is doing in a per-task activity viewer.',
     author: 'local',
@@ -316,8 +317,30 @@ export default class EngramMemoryExtension implements Extension {
    */
   static testPaths: { configPath?: string; statePath?: string } | null = null;
 
+  /**
+   * Test seam (tests/run.ts scenario 23): declare which install directory this
+   * copy sits in, so the harness can seat a global copy and a project-local
+   * copy in one process and assert who wins. AiderDesk never sets it.
+   */
+  static testInstallDir: string | null = null;
+
   private readonly configPath = EngramMemoryExtension.testPaths?.configPath ?? CONFIG_PATH;
   private readonly statePath = EngramMemoryExtension.testPaths?.statePath ?? STATE_PATH;
+  /** Where THIS copy is installed - the basis of the single-instance rule. */
+  private readonly installDir = EngramMemoryExtension.testInstallDir ?? __dirname;
+  /**
+   * This copy's seat on the process-wide instance bus: who owns which project,
+   * and how a copy that lost a project forwards the calls AiderDesk resolves by
+   * extension id. See src/instance.ts.
+   */
+  private readonly seat = new InstanceSeat(this.installDir, {
+    uiData: (componentId, context) => this.getUIExtensionData(componentId, context),
+    uiAction: (componentId, action, args, context) => this.executeUIExtensionAction(componentId, action, args, context),
+    configComponent: (context) => this.getConfigComponent(context),
+    configData: (context) => this.getConfigData(context),
+    saveConfigData: (configData, context) => this.saveConfigData(configData, context),
+  } satisfies EngramInstanceApi);
+
   private config: EngramConfig = loadConfig(this.configPath);
   private state: EngramState = loadState(this.statePath);
   private readonly abortController = new AbortController();
@@ -391,11 +414,25 @@ export default class EngramMemoryExtension implements Extension {
     );
 
     if (!this.config.enabled) {
+      // Deliberately does NOT take a seat: a copy that will do nothing must not
+      // claim a project away from the copy that would have served it.
       activity.withScope({ kind: 'lifecycle' }, () =>
         logger.info('extension is disabled by configuration - idle'),
       );
       return;
     }
+
+    // A global install and a project-local install are two live copies of this
+    // file in one process. Seat this copy on the shared bus so both copies
+    // agree, per project, which one of them is the active one (src/instance.ts).
+    this.seat.activate();
+    activity.withScope({ kind: 'lifecycle' }, () =>
+      logger.info(
+        this.seat.projectDir
+          ? `project-local install for ${this.seat.projectDir} - this copy owns that project, the global copy is idle there`
+          : 'global install - active in every project that has no Engram install of its own',
+      ),
+    );
 
     const memory = getMemoryContextSafely(context);
     if (!memory) {
@@ -428,6 +465,9 @@ export default class EngramMemoryExtension implements Extension {
 
   async onUnload(): Promise<void> {
     this.abortController.abort('extension unloaded');
+    // Give up the seat on the instance bus: with this copy gone, the projects
+    // it owned fall back to the global install.
+    this.seat.release();
     // Let queued work settle so we do not leave half-written memories.
     await Promise.allSettled(Array.from(this.queues.values())).catch(() => undefined);
     saveState(this.statePath, this.state);
@@ -440,6 +480,7 @@ export default class EngramMemoryExtension implements Extension {
    * which is the point where content actually reaches the main model.
    */
   async onPromptStarted(event: PromptStartedEvent, context: ExtensionContext): Promise<void> {
+    if (this.idleIn(context)) return;
     const agentId = await this.agentIdFor(context);
     const cfg = resolveConfig(this.config, agentId);
     if (!cfg.enabled || !cfg.retrieval.enabled) return;
@@ -455,6 +496,9 @@ export default class EngramMemoryExtension implements Extension {
     event: ImportantRemindersEvent,
     context: ExtensionContext,
   ): Promise<void | Partial<ImportantRemindersEvent>> {
+    // Only the copy that owns this project injects. Two copies appending their
+    // own block is how one prompt ended up with two memory contexts.
+    if (this.idleIn(context)) return;
     const taskContext = context.getTaskContext();
     const taskId = taskContext?.data?.id;
     const prompt = (taskId && this.lastPrompt.get(taskId)) || '';
@@ -498,6 +542,7 @@ export default class EngramMemoryExtension implements Extension {
   // -------------------------------------------------------------- extraction
 
   async onAgentFinished(event: AgentFinishedEvent, context: ExtensionContext): Promise<void> {
+    if (this.idleIn(context)) return;
     if (event.aborted) return;
     this.cacheAgentProfiles(context);
     const agentId = await this.agentIdFor(context);
@@ -523,6 +568,7 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async onPromptFinished(event: PromptFinishedEvent, context: ExtensionContext): Promise<void> {
+    if (this.idleIn(context)) return;
     this.cacheAgentProfiles(context);
     // Resolve the per-agent config BEFORE checking the trigger: the global
     // trigger must not mask a per-agent prompt_end override (and vice versa).
@@ -544,6 +590,7 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async onTaskClosed(event: TaskClosedEvent, context: ExtensionContext): Promise<void> {
+    if (this.idleIn(context)) return;
     this.cacheAgentProfiles(context);
     // The prompt map is keyed by task id; without this the entry of every
     // task that ever ran stays for the life of the process (the reminder
@@ -790,6 +837,30 @@ export default class EngramMemoryExtension implements Extension {
     }
   }
 
+  /**
+   * The single-instance gate: true when this copy must stay out of the project
+   * the context points at, because a project-local install owns it (see
+   * src/instance.ts). Every event handler, the command list and the badge
+   * registration run this first, so a project with both installs behaves
+   * exactly like a project with one.
+   *
+   * The reason is logged once per project: a global copy that goes quiet in one
+   * project must read as a decision in the activity feed, not as a broken
+   * install.
+   */
+  private idleIn(context: ExtensionContext): boolean {
+    const projectDir = context.getProjectDir();
+    if (!this.seat.isIdleIn(projectDir)) return false;
+    if (this.seat.firstIdleNotice(projectDir)) {
+      activity.withScope({ kind: 'lifecycle', projectDir }, () =>
+        logger.info(
+          `idle in ${projectDir || '(no project)'} - this project has its own Engram install, so this copy registers nothing here`,
+        ),
+      );
+    }
+    return true;
+  }
+
   private maybeConsolidate(context: ExtensionContext, agentId?: string | null): void {
     const cfg = resolveConfig(this.config, agentId);
     if (!cfg.enabled || !cfg.consolidation.enabled) return;
@@ -938,6 +1009,9 @@ export default class EngramMemoryExtension implements Extension {
   // ---------------------------------------------------------------- commands
 
   getCommands(context: ExtensionContext): CommandDefinition[] {
+    // One command set per project: the copy that lost the project registers
+    // nothing, so `/memory:*` is not listed twice.
+    if (this.idleIn(context)) return [];
     return [
       {
         name: 'memory:extract',
@@ -1170,7 +1244,12 @@ export default class EngramMemoryExtension implements Extension {
 
   // ---------------------------------------------------------------- settings
 
-  getConfigComponent(_context: ExtensionContext): string | undefined {
+  getConfigComponent(context: ExtensionContext): string | undefined {
+    // The settings panel is resolved by extension id, and both copies share it
+    // (the host derives the id from the directory name). Answer for the owner
+    // so the panel always shows one entry backed by the copy that is active.
+    const owner = this.seat.ownerApi(context.getProjectDir());
+    if (owner) return owner.configComponent(context);
     return readJsx(CONFIG_JSX_PATH);
   }
 
@@ -1181,7 +1260,12 @@ export default class EngramMemoryExtension implements Extension {
    * live viewer for the current task. Registered only when
    * `ui.show_activity` is on, so turning it off removes the badge entirely.
    */
-  getUIComponents(_context: ExtensionContext): UIComponentDefinition[] {
+  getUIComponents(context: ExtensionContext): UIComponentDefinition[] {
+    // The reported bug: a global install plus a project-local install rendered
+    // two badges in the same status bar. The copy that lost the project
+    // registers nothing, so a project gets exactly one badge - from the copy
+    // that owns it.
+    if (this.idleIn(context)) return [];
     if (!this.config.ui.show_activity) return [];
     const jsx = readJsx(ACTIVITY_JSX_PATH);
     if (!jsx) return [];
@@ -1198,6 +1282,12 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async getUIExtensionData(componentId: string, context: ExtensionContext): Promise<unknown> {
+    // AiderDesk resolves this by extension id and takes the FIRST copy that
+    // answers - it does not fall through on `undefined`. So a copy that lost
+    // the project must answer FOR the owner, not with nothing: returning
+    // undefined here would leave the badge the owner registered with no data.
+    const owner = this.seat.ownerApi(context.getProjectDir());
+    if (owner) return owner.uiData(componentId, context);
     if (componentId !== ACTIVITY_COMPONENT_ID) return undefined;
     return this.activityStatus(context);
   }
@@ -1212,6 +1302,10 @@ export default class EngramMemoryExtension implements Extension {
     args: unknown[],
     context: ExtensionContext,
   ): Promise<unknown> {
+    // Same resolution rule as the data call: answer for the owner copy, so the
+    // viewer's buttons work no matter which copy the host picked.
+    const owner = this.seat.ownerApi(context.getProjectDir());
+    if (owner) return owner.uiAction(componentId, action, args, context);
     if (componentId !== ACTIVITY_COMPONENT_ID) return undefined;
     const opts = (isPlainObjectArg(args[0]) ? args[0] : {}) as Record<string, unknown>;
     const taskId =
@@ -1444,6 +1538,11 @@ export default class EngramMemoryExtension implements Extension {
   }
 
   async getConfigData(context: ExtensionContext): Promise<unknown> {
+    // The settings panel is resolved by extension id, so the copy the host
+    // picked must show the OWNER's configuration - not its own, when it lost
+    // the project.
+    const owner = this.seat.ownerApi(context.getProjectDir());
+    if (owner) return owner.configData(context);
     const config = loadConfig(this.configPath);
     // `_agents` is UI-only: the list of AiderDesk agent profiles, so the
     // settings panel can render one tab per agent. mergeConfig() ignores
@@ -1490,7 +1589,11 @@ export default class EngramMemoryExtension implements Extension {
     return profiles.length ? { ...config, _agents: profiles, ...extra } : { ...config, ...extra };
   }
 
-  async saveConfigData(configData: unknown, _context: ExtensionContext): Promise<unknown> {
+  async saveConfigData(configData: unknown, context: ExtensionContext): Promise<unknown> {
+    // A save must land in the owning copy's config.json, the file its
+    // extraction rounds actually read.
+    const owner = this.seat.ownerApi(context.getProjectDir());
+    if (owner) return owner.saveConfigData(configData, context);
     const merged = mergeConfig(configData);
     saveConfig(this.configPath, merged);
     this.config = merged;

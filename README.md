@@ -23,6 +23,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 - **Full UI + commands** — settings panel, `Memory: Extract Now`, `Memory: Consolidate`, `Memory: Dedup`, `Memory: Show Statistics`, `Memory: Forget`, `Memory: Clear Project Memories`, `Memory: Activity`.
 - **Dual transport** — direct HTTP to any OpenAI-compatible endpoint (default), or AiderDesk's native `TaskContext.generateText`.
 - **Per-agent configuration** — one global config for every AiderDesk agent, plus optional per-agent overrides (different secondary model, different trigger, or memory off for one agent). Untouched fields always inherit the global config.
+- **One active instance per project** — AiderDesk loads the global install *and* the project install into the same process, so an extension installed in both places runs twice. Engram arbitrates: the **project-local copy owns its project** and the global copy is deactivated there (no badge, no commands, no extraction, no injection), while staying active in every project without its own install. A project therefore shows exactly one `Engram` badge and pays for one extraction round per conversation.
 - **Zero runtime dependencies** — plain `fetch`; no build step; TypeScript loaded directly by AiderDesk's jiti loader.
 
 ## Repository layout
@@ -31,7 +32,7 @@ It is powered by a **secondary local LLM** (llama-server, Ollama /v1, LiteLLM, v
 .aider-desk/extensions/engram/   ← the extension itself (copy this folder)
 ├── index.ts                     Extension: events, commands, settings UI, queues
 ├── src/                         Pipeline modules (extraction, consolidation, …)
-├── tests/                       Offline acceptance harness (22 scenarios)
+├── tests/                       Offline acceptance harness (23 scenarios)
 ├── ConfigComponent.jsx          Settings panel
 ├── EngramActivity.jsx           Activity viewer (badge + feed + memories) rendered in the task
 ├── package.json / tsconfig.json
@@ -160,7 +161,7 @@ engram/
 │   ├── activity.ts        In-memory activity feed (ring buffer, scope, redaction)
 │   ├── cursor.ts          Per-task extraction cursor + content hash
 │   └── logger.ts          Configurable [Memory] … logging
-├── tests/                 Offline harness (22 scenarios, real mock HTTP server)
+├── tests/                 Offline harness (23 scenarios, real mock HTTP server)
 ├── ConfigComponent.jsx    Settings panel
 └── EngramActivity.jsx     Activity viewer (status-bar badge → feed + memories)
 ```
@@ -181,7 +182,7 @@ ln -s /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules node_modules
 # 2) Typecheck (uses AiderDesk's bundled TypeScript; adjust the path to your install):
 /opt/npm/lib/node_modules/@aiderdesk/aiderdesk/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json
 
-# 3) Run the offline test harness (22 scenarios, no real LLM needed):
+# 3) Run the offline test harness (23 scenarios, no real LLM needed):
 node tests/run.mjs
 #    equivalent: ./node_modules/.bin/jiti tests/run.ts
 ```
@@ -277,6 +278,8 @@ Resolution is **global-first** (`resolveConfig()`): the global config is cloned,
    ```
    (per-project install also works: `<project>/.aider-desk/extensions/engram`).
 
+   **Installed in both places?** Since 1.6.0 the project-local copy owns its project and the global copy goes idle there — one badge, one command set, one extraction round per conversation, and the global copy keeps serving every other project. The rule is per project, so a global install plus a project install is a supported setup, not a conflict; the activity feed logs `idle in <project> …` once per project to show which copy is serving it.
+
    **Updating an existing global install — keep the live config.** When the extension is installed in the *global* extensions dir, `config.json` there is the real, working configuration for every project (endpoint, key, model, per-agent overrides), and `state.json` is its counters. Never let an update overwrite them:
    ```bash
    rsync -av --exclude config.json --exclude state.json --exclude node_modules \
@@ -354,6 +357,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | 20 | Statements surface | With `ui.show_content` off the feed and the memories view carry no statements; with it on they name what was written and injected, secrets redacted in the feed, the memories view, the dump and `sanitizeStatements` |
 | 21 | Consolidation backoff | A project with 4 no-progress runs behind it must not consolidate again at 11 minutes (window is 10 min × 2⁴), while the same 11-minute-old attempt with no streak still does — the flat 10-minute cooldown re-ran it every time |
 | 22 | Stall streak persistence | A run that rewrote nothing (every batch failed) persists the stall streak in `state.json`, and a later productive manual run clears it |
+| 23 | Global + project-local install | The local copy owns its project (1 badge, 1 command set, 1 extraction round); the global copy registers nothing there, answers the id-resolved badge/settings calls **for** the owner, keeps serving every other project, and takes the project back when the local install is unloaded |
 
 ## 8. Troubleshooting
 
@@ -367,6 +371,7 @@ node tests/run.mjs          # or: ./node_modules/.bin/jiti tests/run.ts
 | The activity feed and memories view show counts but no statements | `ui.show_content` is off (the default — the statements are derived from your conversations) | Settings → Extensions → Engram → **Show memory statements**; statements are always secret-redacted, so a value you expect to see may appear as `[REDACTED]` |
 | An extraction round's digest is missing from the task-scoped feed | Fixed in 1.5.0: the startup probe cleared the shared feed scope and the digest entry lost its `taskId` | Update to 1.5.0+ |
 | The activity modal cannot be scrolled on a phone — lower log entries are unreachable | Fixed in 1.5.2: the modal content carried a `min-w-[520px]` and no scroll region, so `ModalOverlayLayout` (`fixed inset-[6px] … overflow-hidden`) clipped it on narrow viewports | Update to 1.5.2+; the panel now scrolls as one region and fits the screen width |
+| Two `Engram` badges in the task status bar (and `/memory:*` commands listed twice) | Engram is installed in **both** the global extensions dir and `<project>/.aider-desk/extensions` — AiderDesk loads both copies into one process and never dedupes them | Update to 1.6.0+ (one active instance per project: the project copy wins, the global copy goes idle there and logs `idle in <project> …` in the activity feed), or delete one of the two installs |
 | `generateText … returned no text` (aiderdesk transport) | `model_id` missing in Settings → Models | Create the provider/model or switch back to `transport: "http"` |
 | Extraction timeouts | Slow model on 12 GB | Lower `extraction.max_input_tokens` or raise `timeout_ms` |
 | Nothing is written at all | Candidate importance < `min_importance` | Lower `min_importance` to 2, check `debug` logs |

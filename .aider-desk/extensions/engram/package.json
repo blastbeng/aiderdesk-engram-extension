@@ -1,6 +1,6 @@
 {
   "name": "engram-memory",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "Automatic long-term memory for AiderDesk using a secondary local OpenAI-compatible LLM",
   "main": "index.ts",
   "type": "module",
