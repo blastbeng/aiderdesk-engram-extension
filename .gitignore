@@ -12,3 +12,6 @@
 .aider-desk/extensions/engram/config.json
 .aider-desk/extensions/engram/state.json
 .aider-desk/extensions/engram/node_modules
+
+# Playwright MCP browser-session artifacts (agent scratch, never commit)
+.playwright-mcp/
